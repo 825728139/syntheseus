@@ -1,0 +1,23 @@
+name: gln-env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+  - pyg
+dependencies:
+  - python=3.9
+  - pytorch=1.13.0=py3.9_cuda11.6_cudnn8.3.2_0
+  - scipy
+  - tqdm
+  - boost
+  - boost-cpp
+  - cairo
+  - cmake
+  - eigen
+  - gxx_linux-64
+  - mkl<2024.1.0
+  - pillow
+  - pkg-config
+  - py-boost
+  - pyg==2.1.0
