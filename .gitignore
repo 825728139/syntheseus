@@ -48,6 +48,7 @@ mcts_results
 *.pkl
 *.json
 *.pth
+test*
 
 emolecules.txt
 syntheseus/emolecules.txt
