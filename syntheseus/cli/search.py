@@ -683,6 +683,28 @@ def run_from_config(config: SearchConfig) -> Path:
                 else:
                     assert False
 
+            # 生成 UDS 格式输出（与 Askcos 前端兼容）
+            if config.save_graph:
+                from uds_converter import convert_graph_to_uds
+
+                # 重新获取路径迭代器
+                routes_for_uds = iter_routes_time_order(
+                    output_graph, max_routes=config.num_routes_to_plot
+                )
+
+                # 转换为 UDS 格式
+                uds_data = convert_graph_to_uds(
+                    output_graph=output_graph,
+                    routes_iterator=routes_for_uds,
+                    stats=stats,
+                    max_routes=config.num_routes_to_plot
+                )
+
+                # 保存 UDS 格式文件
+                with open(results_dir / "uds_output.json", "w") as f_uds:
+                    json.dump(uds_data, f_uds, indent=2, ensure_ascii=False)
+                logger.info(f"UDS format output saved to {results_dir / 'uds_output.json'}")
+
         results_lock_path.unlink()
         del results_dir
 
@@ -767,11 +789,11 @@ if __name__ == "__main__":
             "search_target=C1C(=CC=C(C=1)I)CC(=O)OC",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=20",
+            "time_limit_s=30",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
-            "num_routes_to_plot=10",
+            "num_routes_to_plot=50",
         ]
         main(argv=argv)
         

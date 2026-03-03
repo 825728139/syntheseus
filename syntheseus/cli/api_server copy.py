@@ -12,7 +12,6 @@ FastAPI 服务器用于向前端提供逆合成搜索结果 API
 - POST /api/rdkit/validate/: 验证 SMILES 语法
 - POST /api/rdkit/canonicalize/: 标准化 SMILES
 - GET /: 静态前端页面
-- POST /api/tree-search/controller/call-async: 同步树搜索（UDS 格式）
 """
 from __future__ import annotations
 
@@ -134,8 +133,7 @@ async def root():
             "draw": "/api/draw/",
             "rdkit_validate": "/api/rdkit/validate/",
             "rdkit_canonicalize": "/api/rdkit/canonicalize/",
-            "template_sets": "/api/template/sets/",
-            "tree_search_async": "/api/tree-search/controller/call-async"
+            "template_sets": "/api/template/sets/"
         }
     }
 
@@ -177,6 +175,7 @@ async def get_route(route_idx: int):
     返回指定索引路由的完整 JSON 数据，包括所有节点和边的信息。
     """
     json_file = RESULTS_DIR / f"route_{route_idx}.json"
+    # print(json_file)
 
     if not json_file.exists():
         raise HTTPException(status_code=404, detail=f"Route {route_idx} not found")
@@ -463,7 +462,7 @@ async def get_all_paths(results_dir: str = Query(None, description="结果目录
 
     # 使用指定的 results_dir 或默认的 RESULTS_DIR
     base_dir = Path(results_dir) if results_dir else RESULTS_DIR
-
+    print(base_dir)
     # 搜索所有 route_*.json 文件
     for json_file in base_dir.glob("route_*.json"):
         try:
@@ -478,6 +477,8 @@ async def get_all_paths(results_dir: str = Query(None, description="结果目录
 
     # 按路径索引排序
     routes.sort(key=lambda r: int(r["id"].split("_")[1]) if "_" in r["id"] else 0)
+    print('='*8)
+    # print(routes)
 
     # 从第一条路径中提取 target_smiles（depth=0 的节点）
     target_smiles = ""
@@ -531,6 +532,12 @@ async def get_all_paths(results_dir: str = Query(None, description="结果目录
             "min_score": min((r.get("graph", {}).get("min_score", float('inf')) for r in routes)) if routes else 0,
         }
     }
+
+    print(f"[DEBUG] After merge: {len(merged_route['nodes'])} nodes, {len(merged_route['edges'])} edges")
+    print("[DEBUG] Chemical nodes terminal status after merge:")
+    for node in merged_route["nodes"]:
+        if node.get("type") == "chemical":
+            print(f"  {node['smiles']}: terminal={node.get('terminal')}, depth={node.get('depth')}")
 
     return {
         "paths": [merged_route],  # 返回单个合并后的路径
@@ -667,6 +674,7 @@ async def draw_structure(
     highlight: bool = Query(False, description="高亮显示"),
     draw_map: bool = Query(False, description="显示原子映射"),
     input_type: str = Query(None, description="输入类型"),
+    # 新增参数（可选，不影响现有功能）
     size: int = Query(300, description="图像大小（像素）"),
     annotate: bool = Query(False, description="添加注释（暂时忽略）"),
     ppg: float = Query(None, description="价格（暂时忽略）"),
@@ -705,7 +713,6 @@ async def draw_structure(
             media_type="application/json"
         )
 
-
 @app.get("/api/template/sets/")
 async def get_template_sets():
     """
@@ -717,262 +724,6 @@ async def get_template_sets():
         "template_sets": [],
         "attributes": []
     }
-
-
-@app.post("/api/tree-search/controller/call-async")
-async def call_tree_search_async(request: dict):
-    """
-    树搜索控制端点（同步执行）
-
-    整合搜索启动和结果返回功能，返回与 askcos_return1.json 一致的格式。
-
-    该端点会：
-    1. 接收 SMILES 和搜索参数
-    2. 同步执行搜索（等待完成）
-    3. 加载生成的 UDS 格式数据
-    4. 返回完整的 Askcos 响应格式
-
-    Args:
-        request: 包含以下字段的字典：
-            - smiles: 目标分子 SMILES（必需）
-            - time_limit_s: 搜索时间限制（秒，默认 30）
-            - num_routes: 最大路径数（默认 50）
-            - search_algorithm: 搜索算法（默认 "mcts"）
-            - timeout: 超时时间（秒，默认 300）
-
-    Returns:
-        与 askcos_return1.json 一致的 JSON 响应，包含：
-        - task_id: 任务 ID
-        - state: "SUCCESS" | "FAILED"
-        - complete: 是否完成
-        - failed: 是否失败
-        - percent: 完成百分比
-        - message: 状态消息
-        - output.result.stats: 统计信息
-        - output.result.uds: UDS 格式数据
-    """
-    '''
-    global task_counter
-
-    # 提取参数
-    smiles = request.get("smiles", "").strip()
-    if not smiles:
-        raise HTTPException(status_code=400, detail="SMILES is required")
-
-    time_limit = request.get("time_limit_s", 30)
-    num_routes = request.get("num_routes", 50)
-    algorithm = request.get("search_algorithm", "mcts")
-
-    # 获取 task_id
-    with search_tasks_lock:
-        task_id = f"task_{task_counter}"
-        task_counter += 1
-
-    # 创建结果目录
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    results_dir = Path(f"/home/liwenlong/retro_mcts_results/SimpRetro_{timestamp}")
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    # 构建命令行参数
-    argv = [
-        "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-        f"search_target={smiles}",
-        "model_class=SimpRetro",
-        "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-        f"time_limit_s={time_limit}",
-        f"search_algorithm={algorithm}",
-        f"results_dir={results_dir}",
-        "use_gpu=False",
-        f"num_routes_to_plot={num_routes}",
-        "expand_purchasable_target=True",
-        "save_graph=true",
-    ]
-
-    # 记录开始时间
-    start_time = datetime.now()
-
-    # 同步运行搜索
-    def run_search_sync():
-        from syntheseus.cli.search import main as search_main
-        import sys
-        original_argv = sys.argv
-        sys.argv = ["search.py"] + argv
-        try:
-            search_main()
-            # 查找实际的结果目录
-            for subdir in results_dir.iterdir():
-                if subdir.is_dir() and list(subdir.glob("uds_output.json")):
-                    return str(subdir)
-            return str(results_dir)
-        finally:
-            sys.argv = original_argv
-
-    # 在线程池中运行搜索
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(run_search_sync)
-        try:
-            # 等待搜索完成
-            timeout = request.get("timeout", 300)
-            actual_results_dir = future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise HTTPException(
-                status_code=408,
-                detail=f"Search timeout after {timeout} seconds"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Search failed: {str(e)}"
-            )
-
-    # 计算搜索时间
-    end_time = datetime.now()
-    build_time = (end_time - start_time).total_seconds()
-
-    # 加载 UDS 数据
-    uds_path = Path(actual_results_dir) / "uds_output.json"
-    '''
-    uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-03T08:41:07") / "uds_output.json"
-    if not uds_path.exists():
-        raise HTTPException(
-            status_code=500,
-            detail="UDS output not generated. Search may have failed."
-        )
-
-    with open(uds_path, 'r', encoding='utf-8') as f:
-        uds_data = json.load(f)
-
-    # 构建统计信息
-    node_dict = uds_data.get("node_dict", {})
-    chemical_nodes = [n for n in node_dict.values() if n.get("type") == "chemical"]
-    reaction_nodes = [n for n in node_dict.values() if n.get("type") == "reaction"]
-
-    stats_override = {
-        "total_iterations": 1,
-        "total_chemicals": len(chemical_nodes),
-        "total_reactions": len(reaction_nodes),
-        "total_templates": len(reaction_nodes),
-        "total_paths": len(uds_data.get("pathways", [])),
-        "first_path_time": 0.0,
-        "build_time": round(99, 3),
-        "path_time": 0.0
-    }
-
-    # 包装成 Askcos 响应格式
-    from data_adapter import wrap_uds_to_askcos_response
-    response = wrap_uds_to_askcos_response(
-        uds_data=uds_data,
-        task_id="task_0",
-        target_smiles="smiles",
-        stats_override=stats_override
-    )
-
-    return response
-
-
-@app.get("/api/legacy/celery/task/{task_id}")
-async def get_celery_task_status(task_id: str):
-    """
-    获取 Celery 异步任务状态（兼容前端轮询）
-
-    用于前端轮询异步任务状态，当任务完成时返回完整输出。
-
-    Args:
-        task_id: 任务 ID
-
-    Returns:
-        包含任务状态的字典：
-        - complete: 任务是否完成
-        - failed: 任务是否失败
-        - output: 任务输出（当 complete=true 时）
-    """
-    with search_tasks_lock:
-        if task_id not in search_tasks:
-            # 如果任务不存在，可能是已完成的任务，尝试从缓存获取
-            # 对于同步执行的场景，任务可能很快完成
-            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-
-        task = search_tasks[task_id]
-        status = task.get("status", "unknown")
-
-    # 根据任务状态返回不同响应
-    if status == "completed":
-        # 任务完成，返回完整输出
-        results_dir = task.get("results_dir")
-        if not results_dir:
-            return {
-                "complete": True,
-                "failed": True,
-                "output": {"error": "Results directory not found"}
-            }
-
-        # 加载 UDS 数据
-        uds_path = Path(results_dir) / "uds_output.json"
-        if not uds_path.exists():
-            return {
-                "complete": True,
-                "failed": True,
-                "output": {"error": "UDS output not generated"}
-            }
-
-        with open(uds_path, 'r', encoding='utf-8') as f:
-            uds_data = json.load(f)
-
-        # 构建统计信息
-        node_dict = uds_data.get("node_dict", {})
-        chemical_nodes = [n for n in node_dict.values() if n.get("type") == "chemical"]
-        reaction_nodes = [n for n in node_dict.values() if n.get("type") == "reaction"]
-
-        stats_override = {
-            "total_iterations": 1,
-            "total_chemicals": len(chemical_nodes),
-            "total_reactions": len(reaction_nodes),
-            "total_templates": len(reaction_nodes),
-            "total_paths": len(uds_data.get("pathways", [])),
-            "first_path_time": 0.0,
-            "build_time": 0.0,
-            "path_time": 0.0
-        }
-
-        # 包装成 Askcos 响应格式
-        from data_adapter import wrap_uds_to_askcos_response
-        response = wrap_uds_to_askcos_response(
-            uds_data=uds_data,
-            task_id=task_id,
-            target_smiles=task.get("smiles", ""),
-            stats_override=stats_override
-        )
-
-        return {
-            "complete": True,
-            "failed": False,
-            "output": response
-        }
-
-    elif status == "failed":
-        # 任务失败
-        return {
-            "complete": True,
-            "failed": True,
-            "output": {"error": task.get("error", "Unknown error")}
-        }
-
-    elif status == "running":
-        # 任务仍在运行
-        return {
-            "complete": False,
-            "failed": False,
-            "output": {"status": "running", "percent": 0}
-        }
-
-    else:
-        # 未知状态
-        return {
-            "complete": False,
-            "failed": False,
-            "output": {"status": status, "percent": 0}
-        }
 
 
 # 运行服务器
