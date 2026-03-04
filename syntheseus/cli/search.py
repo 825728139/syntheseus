@@ -681,6 +681,7 @@ def run_from_config(config: SearchConfig) -> Path:
                             reaction = edge_data["reaction"]
                             rxn_smiles = reaction.reaction_smiles
                             probability = reaction.metadata['probability']
+                            template = edge_data['reaction'].metadata['template']
                             product = [*reaction.products]
                             reactants = [*reaction.reactants]
 
@@ -693,7 +694,7 @@ def run_from_config(config: SearchConfig) -> Path:
 
                                     uds["node_dict"][chem_smiles] = {
                                         "smiles": chem_smiles,
-                                        "as_reactant": 1,
+                                        "as_reactant": template,
                                         "as_product": 1,
                                         "properties": [{"link": ""}, {"availability": ""}],
                                         "purchase_price": 1.0 if chem_metadata['is_purchasable'] else False,
@@ -747,7 +748,7 @@ def run_from_config(config: SearchConfig) -> Path:
                                                 "index": 0,
                                                 "intra_only": False,
                                                 "necessary_reagent": "",
-                                                "reaction_smarts": rxn_smiles,
+                                                "reaction_smarts": template,
                                                 "template_set": "syntheseus",
                                                 "_id": rxn_smiles,
                                                 "template_score": node_data['policy_score'],
@@ -862,7 +863,8 @@ def run_from_config(config: SearchConfig) -> Path:
                                     'reaction_smiles': rxn_smiles,
                                     'reactants': [r.smiles for r in reactants],
                                     'product': [p.smiles for p in product],
-                                    'metadata': {'probability': probability}
+                                    'metadata': {'probability': probability,
+                                                 'template': template}
                                 }
                             })
 
@@ -1043,7 +1045,7 @@ if __name__ == "__main__":
             "search_target=CNC(=O)COc1cc(Cl)c(Cc2ccc(O)c(C(C)C)c2)c(Cl)c1",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=1800",
+            "time_limit_s=30",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",

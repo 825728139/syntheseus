@@ -833,7 +833,7 @@ async def call_tree_search_async(request: dict):
     # 加载 UDS 数据
     uds_path = Path(actual_results_dir) / "uds_askcos.json"
     '''
-    uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-04T10:01:53") / "uds_askcos.json"
+    uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-04T16:55:57") / "uds_askcos.json"
     if not uds_path.exists():
         raise HTTPException(
             status_code=500,

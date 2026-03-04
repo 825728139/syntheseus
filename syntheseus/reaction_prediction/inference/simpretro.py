@@ -288,7 +288,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
             process_raw_smiles_outputs_backwards(
                 input=input,
                 output_list=output[0],
-                metadata_list=[{"probability": score} for score in output[1]],
+                metadata_list=[{"probability": score, "template": temp_smarts} for score in output[1]],
             )
-            for input, output in zip(inputs, raw_outputs)
+            for input, output, temp_smarts in zip(inputs, raw_outputs, templates)
         ]
