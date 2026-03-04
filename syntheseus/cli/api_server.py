@@ -801,7 +801,7 @@ async def call_tree_search_async(request: dict):
             search_main()
             # 查找实际的结果目录
             for subdir in results_dir.iterdir():
-                if subdir.is_dir() and list(subdir.glob("uds_output.json")):
+                if subdir.is_dir() and list(subdir.glob("uds_askcos.json")):
                     return str(subdir)
             return str(results_dir)
         finally:
@@ -831,9 +831,9 @@ async def call_tree_search_async(request: dict):
     build_time = (end_time - start_time).total_seconds()
 
     # 加载 UDS 数据
-    uds_path = Path(actual_results_dir) / "uds_output.json"
+    uds_path = Path(actual_results_dir) / "uds_askcos.json"
     '''
-    uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-03T08:41:07") / "uds_output.json"
+    uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-04T10:01:53") / "uds_askcos.json"
     if not uds_path.exists():
         raise HTTPException(
             status_code=500,
@@ -908,7 +908,7 @@ async def get_celery_task_status(task_id: str):
             }
 
         # 加载 UDS 数据
-        uds_path = Path(results_dir) / "uds_output.json"
+        uds_path = Path(results_dir) / "uds_askcos.json"
         if not uds_path.exists():
             return {
                 "complete": True,

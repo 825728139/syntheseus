@@ -35,6 +35,7 @@ from enum import Enum
 from pathlib import Path
 from pprint import pformat
 from typing import Any, Dict, Iterator, List, Optional, cast
+from uuid import uuid4
 
 import yaml
 from omegaconf import MISSING, DictConfig, OmegaConf
@@ -625,30 +626,285 @@ def run_from_config(config: SearchConfig) -> Path:
                 output_graph, max_routes=config.num_routes_to_plot
             )
 
+            # 初始化 UDS 格式字典
+            uds = {
+                "node_dict": {},      # {smiles: node_info}
+                "graph": [],          # [{source: smiles, target: smiles}, ...]
+                "pathways": [],       # [[{source: uuid, target: uuid}, ...], ...]
+                "pathways_properties": [],  # [{depth, precursor_cost, score, cluster_id}, ...]
+                "uuid2smiles": {}     # {uuid: smiles}
+            }
+            global_smiles_to_uuid = {}  # 全局 SMILES 到 UUID 的映射
+            ROOT_UUID = "00000000-0000-0000-0000-000000000000"
+            routes = list(routes)
+
+            # 获取根节点 SMILES（目标分子）添加到 node_dict
+            root_node = list(routes[0])[0]
+            if hasattr(root_node, 'mol'):
+                root_molecule = root_node.mol
+            elif hasattr(root_node, 'mols'):
+                root_molecule = list(root_node.mols)[0]
+            else:
+                root_molecule = None
+            
+            uds["node_dict"][root_molecule.smiles] = {
+                "smiles": root_molecule.smiles,
+                "as_reactant": 1,
+                "as_product": 1,
+                "properties": [{"link": ""}, {"availability": ""}],
+                "purchase_price": 1.0 if root_molecule.metadata['is_purchasable'] else False,
+                "terminal": False,
+                "type": "chemical",
+                "id": root_molecule.smiles
+            }
+            # 为根节点分配固定 UUID
+            global_smiles_to_uuid[root_molecule.smiles] = ROOT_UUID
+            uds["uuid2smiles"][ROOT_UUID] = root_molecule.smiles
+
             for route_idx, route in enumerate(routes):
-                # 提取路径的边信息（对于 MolSetGraph，反应存储在边上）
+                # 初始化当前路径的 SMILES 到 UUID 映射
+                pathway_smiles_to_uuid = {}
+                pathway_edges = []
+
+                # 提取路径的边信息并构建 UDS 数据
                 route_edges = []
                 if isinstance(output_graph, MolSetGraph):
-                    # MolSetGraph: 路径是有序节点序列，提取相邻节点间的边
-                    route_list = list(route)
+                    # MolSetGraph: 路径是有序节点序列，按深度提取相邻节点间的边
+                    route_list = sorted(list(route), key=lambda x: x.depth)
                     for i in range(len(route_list) - 1):
                         u, v = route_list[i], route_list[i + 1]
                         edge_data = output_graph._graph.get_edge_data(u, v)
+                        
+                        node_depth = i+1
+                        
                         if edge_data and "reaction" in edge_data:
+                            reaction = edge_data["reaction"]
+                            rxn_smiles = reaction.reaction_smiles
+                            probability = reaction.metadata['probability']
+                            product = [*reaction.products]
+                            reactants = [*reaction.reactants]
+
+                            # 添加化学节点到 node_dict		
+                            for chem_molecule in reactants:
+                                chem_smiles = chem_molecule.smiles
+                                chem_metadata = chem_molecule.metadata
+                                if chem_smiles and chem_smiles not in uds["node_dict"]:
+                                    # 从 metadata 中获取 purchasable 信息
+
+                                    uds["node_dict"][chem_smiles] = {
+                                        "smiles": chem_smiles,
+                                        "as_reactant": 1,
+                                        "as_product": 1,
+                                        "properties": [{"link": ""}, {"availability": ""}],
+                                        "purchase_price": 1.0 if chem_metadata['is_purchasable'] else False,
+                                        "terminal": node_depth > 0 and chem_metadata['is_purchasable'],
+                                        "type": "chemical",
+                                        "id": chem_smiles
+                                    }
+
+                                    # 生成/复用 UUID
+                                    if chem_smiles == root_smiles:
+                                        uuid = ROOT_UUID
+                                    elif chem_smiles in global_smiles_to_uuid:
+                                        uuid = global_smiles_to_uuid[chem_smiles]
+                                    else:
+                                        uuid = str(uuid4())
+                                        global_smiles_to_uuid[chem_smiles] = uuid
+
+                                    pathway_smiles_to_uuid[chem_smiles] = uuid
+                                    if uuid not in uds["uuid2smiles"]:
+                                        uds["uuid2smiles"][uuid] = chem_smiles
+
+                            # 添加反应节点到 node_dict
+                            if rxn_smiles and rxn_smiles not in uds["node_dict"]:
+                                # 获取节点数据用于 model_metadata
+                                node_data = {}
+                                if hasattr(v, 'data'):
+                                    node_data = dict(v.data)
+
+                                uds["node_dict"][rxn_smiles] = {
+                                    "smiles": rxn_smiles,
+                                    "plausibility": probability,
+                                    "rxn_score_from_model": probability,
+                                    "model_metadata": [{
+                                        "direction": "retro",
+                                        "backend": "template_relevance",
+                                        "model_name": "syntheseus",
+                                        "attributes": {
+                                            "max_num_templates": v.num_visit,
+                                            "max_cum_prob": 0.999,
+                                            "attribute_filter": []
+                                        },
+                                        "model_score": node_data['policy_score'],
+                                        "normalized_model_score": node_data['policy_score'],
+                                        "rank": 1,
+                                        "reaction_id": None,
+                                        "reaction_set": None,
+                                        "source": {
+                                            "template": {
+                                                "count": 1,
+                                                "dimer_only": False,
+                                                "index": 0,
+                                                "intra_only": False,
+                                                "necessary_reagent": "",
+                                                "reaction_smarts": rxn_smiles,
+                                                "template_set": "syntheseus",
+                                                "_id": rxn_smiles,
+                                                "template_score": node_data['policy_score'],
+                                                "template_rank": 1,
+                                                "num_examples": 1
+                                            }
+                                        }
+                                    }],
+                                    "precursor_properties": {
+                                        "rms_molwt": 0.0,
+                                        "num_rings": 0,
+                                        "scscore": 0.0
+                                    },
+                                    "precursor_rank": 1,
+                                    "precursor_score": probability,
+                                    "reaction_properties": {
+                                        "canonical_reaction_smiles": rxn_smiles,
+                                        "mapped_smiles": rxn_smiles,
+                                        "plausibility": probability,
+                                        "reacting_atoms": [],
+                                        "selec_error": None,
+                                        "cluster_id": None,
+                                        "cluster_name": None
+                                    },
+                                    "type": "reaction",
+                                    "id": rxn_smiles
+                                }
+
+                                # 生成/复用反应 UUID
+                                if rxn_smiles in global_smiles_to_uuid:
+                                    uuid = global_smiles_to_uuid[rxn_smiles]
+                                else:
+                                    uuid = str(uuid4())
+                                    global_smiles_to_uuid[rxn_smiles] = uuid
+                                pathway_smiles_to_uuid[rxn_smiles] = uuid
+                                if uuid not in uds["uuid2smiles"]:
+                                    uds["uuid2smiles"][uuid] = rxn_smiles
+
+                            # 添加到 graph（使用 SMILES）
+                            # 产物 -> 反应
+                            for prod_mol in product:
+                                prod_smiles = prod_mol.smiles
+                                if prod_smiles and rxn_smiles:
+                                    edge_key = (prod_smiles, rxn_smiles)
+                                    if not any(e.get('source') == prod_smiles and e.get('target') == rxn_smiles for e in uds["graph"]):
+                                        uds["graph"].append({"source": prod_smiles, "target": rxn_smiles})
+
+                            # 反应 -> 反应物
+                            for reactant_mol in reactants:
+                                reactant_smiles = reactant_mol.smiles
+                                if reactant_smiles and rxn_smiles:
+                                    edge_key = (rxn_smiles, reactant_smiles)
+                                    if not any(e.get('source') == rxn_smiles and e.get('target') == reactant_smiles for e in uds["graph"]):
+                                        uds["graph"].append({"source": rxn_smiles, "target": reactant_smiles})
+
+                            # 确保 rxn_smiles 在 pathway_smiles_to_uuid 中
+                            if rxn_smiles and rxn_smiles not in pathway_smiles_to_uuid:
+                                if rxn_smiles in global_smiles_to_uuid:
+                                    pathway_smiles_to_uuid[rxn_smiles] = global_smiles_to_uuid[rxn_smiles]
+                                else:
+                                    # 这种情况不应该发生，因为应该在前面已经处理过
+                                    uuid = str(uuid4())
+                                    global_smiles_to_uuid[rxn_smiles] = uuid
+                                    pathway_smiles_to_uuid[rxn_smiles] = uuid
+
+                            # 确保 product 的 SMILES 在 pathway_smiles_to_uuid 中
+                            for prod_mol in product:
+                                prod_smiles = prod_mol.smiles
+                                if prod_smiles and prod_smiles not in pathway_smiles_to_uuid:
+                                    if prod_smiles in global_smiles_to_uuid:
+                                        pathway_smiles_to_uuid[prod_smiles] = global_smiles_to_uuid[prod_smiles]
+                                    else:
+                                        uuid = str(uuid4())
+                                        global_smiles_to_uuid[prod_smiles] = uuid
+                                        pathway_smiles_to_uuid[prod_smiles] = uuid
+
+                            # 确保 reactants 的 SMILES 在 pathway_smiles_to_uuid 中
+                            for reactant_mol in reactants:
+                                reactant_smiles = reactant_mol.smiles
+                                if reactant_smiles and reactant_smiles not in pathway_smiles_to_uuid:
+                                    if reactant_smiles in global_smiles_to_uuid:
+                                        pathway_smiles_to_uuid[reactant_smiles] = global_smiles_to_uuid[reactant_smiles]
+                                    else:
+                                        uuid = str(uuid4())
+                                        global_smiles_to_uuid[reactant_smiles] = uuid
+                                        pathway_smiles_to_uuid[reactant_smiles] = uuid
+
+                            # 添加到 pathways（使用 UUID）
+                            # 产物 -> 反应
+                            for prod_mol in product:
+                                prod_smiles = prod_mol.smiles
+                                if prod_smiles and rxn_smiles:
+                                    pathway_edges.append({
+                                        "source": pathway_smiles_to_uuid[prod_smiles],
+                                        "target": pathway_smiles_to_uuid[rxn_smiles]
+                                    })
+
+                            # 反应 -> 反应物
+                            for reactant_mol in reactants:
+                                reactant_smiles = reactant_mol.smiles
+                                if reactant_smiles and rxn_smiles:
+                                    pathway_edges.append({
+                                        "source": pathway_smiles_to_uuid[rxn_smiles],
+                                        "target": pathway_smiles_to_uuid[reactant_smiles]
+                                    })
+
+                            # 保留原有的 route_edges 格式
                             route_edges.append({
                                 'source_id': str(id(u)),
                                 'target_id': str(id(v)),
-                                'reaction': serialize_reaction(edge_data["reaction"])
+                                'reaction': {
+                                    'reaction_smiles': rxn_smiles,
+                                    'reactants': [r.smiles for r in reactants],
+                                    'product': [p.smiles for p in product],
+                                    'metadata': {'probability': probability}
+                                }
                             })
 
-                # 序列化节点
+                # 序列化节点（保留原有逻辑用于单独的 route 文件）
                 serialized_nodes = []
                 node_id_to_index = {}
-                for idx, node in enumerate(route):
+                for idx, node in enumerate(route_list):
                     node_id = str(id(node))
                     node_id_to_index[node_id] = idx
-                    serialized_node = serialize_node(node)
-                    serialized_node['local_index'] = idx
+
+                    # 手动序列化节点（不依赖 json_graph）
+                    serialized_node = {
+                        'id': node_id,
+                        'has_solution': node.has_solution,
+                        'num_visit': node.num_visit,
+                        'depth': node.depth,
+                        'is_expanded': node.is_expanded,
+                        'creation_time': node.creation_time.isoformat() if node.creation_time else None,
+                        'data': dict(node.data),
+                        'local_index': idx
+                    }
+
+                    if hasattr(node, 'mol'):
+                        serialized_node.update({
+                            'type': 'OrNode',
+                            'smiles': node.mol.smiles,
+                            'is_purchasable': node.mol.metadata.get('is_purchasable', False),
+                        })
+                    elif hasattr(node, 'reaction'):
+                        serialized_node.update({
+                            'type': 'AndNode',
+                            'reaction_smiles': node.reaction.reaction_smiles,
+                            'reactants': [r.smiles for r in node.reaction.reactants],
+                            'product': node.reaction.product.smiles,
+                        })
+                    elif hasattr(node, 'mols'):
+                        serialized_node.update({
+                            'type': 'MolSetNode',
+                            'smiles_list': sorted([mol.smiles for mol in node.mols]),
+                            'is_purchasable': all(mol.metadata.get('is_purchasable', False) for mol in node.mols),
+                        })
+
                     serialized_nodes.append(serialized_node)
 
                 # 更新边中的索引引用
@@ -670,6 +926,18 @@ def run_from_config(config: SearchConfig) -> Path:
                 with open(results_dir / f"route_{route_idx}.json", "w") as f_route:
                     json.dump(route_data, f_route, indent=2, ensure_ascii=False)
 
+                # 添加到 UDS pathways 和 pathways_properties
+                if pathway_edges:
+                    uds["pathways"].append(pathway_edges)
+                    # 计算路径深度
+                    max_depth = max(node.depth for node in route_list)
+                    uds["pathways_properties"].append({
+                        "depth": max_depth,
+                        "precursor_cost": "precursor_cost",
+                        "score": None,
+                        "cluster_id": None
+                    })
+
                 visualize_kwargs: Dict[str, Any] = dict(
                     graph=output_graph,
                     filename=str(results_dir / f"route_{route_idx}.pdf"),
@@ -683,27 +951,12 @@ def run_from_config(config: SearchConfig) -> Path:
                 else:
                     assert False
 
-            # 生成 UDS 格式输出（与 Askcos 前端兼容）
+            # 生成 UDS Askcos 格式输出
             if config.save_graph:
-                from uds_converter import convert_graph_to_uds
-
-                # 重新获取路径迭代器
-                routes_for_uds = iter_routes_time_order(
-                    output_graph, max_routes=config.num_routes_to_plot
-                )
-
-                # 转换为 UDS 格式
-                uds_data = convert_graph_to_uds(
-                    output_graph=output_graph,
-                    routes_iterator=routes_for_uds,
-                    stats=stats,
-                    max_routes=config.num_routes_to_plot
-                )
-
-                # 保存 UDS 格式文件
-                with open(results_dir / "uds_output.json", "w") as f_uds:
-                    json.dump(uds_data, f_uds, indent=2, ensure_ascii=False)
-                logger.info(f"UDS format output saved to {results_dir / 'uds_output.json'}")
+                uds_file = results_dir / "uds_askcos.json"
+                with open(uds_file, "w") as f_uds:
+                    json.dump(uds, f_uds, indent=2, ensure_ascii=False)
+                logger.info(f"UDS Askcos format output saved to {uds_file}")
 
         results_lock_path.unlink()
         del results_dir
@@ -784,12 +1037,13 @@ if __name__ == "__main__":
         # search_target='Cc1c(C[C@H](C)N)sc2c(NCc3cccs3)cc(Cl)nc12'
         # search_target="NC1=Nc2ccc(F)cc2C2CCCC12"
         # "COc1cccc(OC(=O)/C=C/c2cc(OC)c(OC)c(OC)c2)c1"
+        # CNC(=O)COc1cc(Cl)c(Cc2ccc(O)c(C(C)C)c2)c(Cl)c1
         argv = [
             "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-            "search_target=C1C(=CC=C(C=1)I)CC(=O)OC",
+            "search_target=CNC(=O)COc1cc(Cl)c(Cc2ccc(O)c(C(C)C)c2)c(Cl)c1",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=30",
+            "time_limit_s=1800",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
