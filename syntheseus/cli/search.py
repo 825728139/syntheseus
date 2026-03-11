@@ -368,6 +368,24 @@ class SearchConfig(BackwardModelConfig, BaseSearchConfig):
 def run_from_config(config: SearchConfig) -> Path:
     set_random_seed(0)
 
+    # 配置日志: 同时输出到终端和文件
+    log_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 终端处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(log_formatter)
+
+    # 为根logger添加处理器
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(console_handler)
+
+    # 文件处理器将在 results_dir 创建后添加
+
     print("Running search with the following config:")
     print(config)
 
@@ -429,6 +447,15 @@ def run_from_config(config: SearchConfig) -> Path:
 
     results_dir_current_run = results_dir_top_level / dirname
 
+    # 添加文件日志处理器
+    results_dir_current_run.mkdir(parents=True, exist_ok=True)
+    log_file = results_dir_current_run / "search.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(file_handler)
+
+    logger.info(f"日志文件将保存到: {log_file}")
     logger.info("Setup completed")
     num_targets = len(search_targets)
 
@@ -1048,7 +1075,7 @@ if __name__ == "__main__":
             "search_target=C1=COC(/C=C2/C(=O)C3=C(C/2=O)C=CC=C3)=C1",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=300",
+            "time_limit_s=10",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
