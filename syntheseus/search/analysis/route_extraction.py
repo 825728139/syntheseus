@@ -67,7 +67,7 @@ def _iter_top_routes(
         and num_routes_yielded < max_routes
         and (datetime.now() - start_time).total_seconds() < max_time_s
     ):
-        # Pop route
+        # Pop route; is_true_cost 布尔值，用于判断是否是完整路线
         cost, is_true_cost, _, partial_route, route_frontier = heapq.heappop(queue)
         assert cost < math.inf, "Infinite cost routes should not be in the queue."
 

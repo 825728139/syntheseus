@@ -51,7 +51,7 @@ from syntheseus.search.algorithms.best_first.retro_star import RetroStarSearch
 from syntheseus.search.algorithms.mcts import base as mcts_base
 from syntheseus.search.algorithms.mcts.molset import MolSetMCTS
 from syntheseus.search.algorithms.pdvn import PDVN_MCTS
-from syntheseus.search.analysis.route_extraction import iter_routes_time_order
+from syntheseus.search.analysis.route_extraction import iter_routes_time_order, iter_routes_cost_order
 from syntheseus.search.analysis.solution_time import get_first_solution_time
 from syntheseus.search.graph.and_or import AndOrGraph
 from syntheseus.search.graph.molset import MolSetGraph
@@ -279,7 +279,7 @@ class SearchAlgorithmConfig:
     limit_graph_nodes: int = INT_INF
     prevent_repeat_mol_in_trees: bool = True
     stop_on_first_solution: bool = False
-    expand_purchasable_target: bool = True  # Whether to expand target even if it's purchasable
+    expand_purchasable_target: bool = False  # Whether to expand target even if it's purchasable
 
 
 def search_algorithm_config_to_kwargs(config: SearchAlgorithmConfig) -> Dict[str, Any]:
@@ -625,6 +625,9 @@ def run_from_config(config: SearchConfig) -> Path:
             routes: Iterator = iter_routes_time_order(
                 output_graph, max_routes=config.num_routes_to_plot
             )
+            # routes: Iterator = iter_routes_cost_order(
+            #     output_graph, max_routes=config.num_routes_to_plot
+            # )
 
             # 初始化 UDS 格式字典
             uds = {
@@ -1042,14 +1045,16 @@ if __name__ == "__main__":
         # CNC(=O)COc1cc(Cl)c(Cc2ccc(O)c(C(C)C)c2)c(Cl)c1
         argv = [
             "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-            "search_target=CNC(=O)COc1cc(Cl)c(Cc2ccc(O)c(C(C)C)c2)c(Cl)c1",
+            "search_target=C1=COC(/C=C2/C(=O)C3=C(C/2=O)C=CC=C3)=C1",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=30",
+            "time_limit_s=300",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
             "num_routes_to_plot=50",
+            "mcts_config.max_expansion_depth=20",
+            "expand_purchasable_target=True",
         ]
         main(argv=argv)
         

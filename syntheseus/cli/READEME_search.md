@@ -25,6 +25,7 @@ python search.py \
     model_dir=/path/to/model \
     time_limit_s=60 \
     search_algorithm=retro_star \
+    num_routes_to_plot=10 \
     results_dir=results/
 ```
 
@@ -42,6 +43,7 @@ python search.py \
     increment_time_s=30 \
     max_continues=10 \
     search_algorithm=retro_star \
+    num_routes_to_plot=10 \
     results_dir=results/
 ```
 
@@ -85,10 +87,11 @@ python search.py \
 ### 输出文件
 
 交互模式下，路径文件按迭代轮次命名：
-- `route_0.pkl`, `route_0.pdf` - 第1轮发现的路径
-- `route_1.pkl`, `route_1.pdf` - 第2轮新发现的路径
-- `route_2.pkl`, `route_2.pdf` - 第3轮新发现的路径
+- `route_0.json`, `route_0.pdf` - 第1轮发现的第1条路径
+- `route_1.json`, `route_1.pdf` - 第1轮发现的第2条路径
+- `route_2.json`, `route_2.pdf` - 第1轮发现的第3天路径
 - ...
+- `uds_askcos.json` - 第1轮发现的前num_routes_to_plot条路径集合（前端需求的json格式）
 
 ## 注意事项
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import threading
+from glom import glom
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -139,7 +140,7 @@ async def root():
         }
     }
 
-
+'''
 @app.get("/api/routes", response_model=List[RouteSummary])
 async def list_routes():
     """
@@ -227,29 +228,19 @@ async def get_stats():
         return stats_data
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Invalid JSON file for stats")
-
+'''
 
 @app.post("/api/rdkit/validate/")
 async def validate_smiles(request: dict):
     """
     验证 SMILES 语法（Askcos 兼容端点）
-
+    --- NetworkView.vue的validatesmiles函数调用，该函数被我注释掉了 ---
     Args:
         request: 包含 "smiles" 字段的字典
 
     Returns:
         包含验证结果的字典
     """
-    try:
-        from rdkit import Chem
-    except ImportError:
-        # 如果 RDKit 不可用，返回简单验证
-        smiles = request.get("smiles", "")
-        return {
-            "correct_syntax": bool(smiles and len(smiles) > 0),
-            "valid_chem_name": bool(smiles and len(smiles) > 0),  # 简化处理
-            "smiles": smiles
-        }
 
     smiles = request.get("smiles", "")
     try:
@@ -274,12 +265,6 @@ async def canonicalize_smiles(request: dict):
     Returns:
         包含标准化 SMILES 的字典
     """
-    try:
-        from rdkit import Chem
-    except ImportError:
-        # 如果 RDKit 不可用，返回原始 SMILES
-        smiles = request.get("smiles", "")
-        return {"smiles": smiles}
 
     smiles = request.get("smiles", "")
     try:
@@ -291,167 +276,7 @@ async def canonicalize_smiles(request: dict):
         pass
     return {"smiles": smiles}
 
-
-@app.post("/api/search/start/")
-async def start_search(request: dict):
-    """
-    启动逆合成搜索任务
-
-    接收 SMILES，调用 search.py 进行搜索
-
-    Args:
-        request: 包含 "smiles" 等字段的字典
-
-    Returns:
-        包含 task_id 的任务信息
-    """
-    global task_counter
-
-    smiles = request.get("smiles", "").strip()
-    if not smiles:
-        raise HTTPException(status_code=400, detail="SMILES is required")
-
-    # 打印 SMILES（调试用）
-    print(f"[SEARCH] Received SMILES: {smiles}")
-
-    # 获取可选参数
-    time_limit = request.get("time_limit_s", 30)
-    num_routes = request.get("num_routes", 50)
-    algorithm = request.get("search_algorithm", "mcts")
-
-    # 获取 task_id（线程安全）
-    with search_tasks_lock:
-        task_id = f"task_{task_counter}"
-        task_counter += 1
-
-    # 构建命令行参数
-    argv = [
-        "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-        f"search_target={smiles}",
-        "model_class=SimpRetro",
-        "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-        f"time_limit_s={time_limit}",
-        f"search_algorithm={algorithm}",
-        "results_dir=retro_mcts_results/",
-        "use_gpu=False",
-        f"num_routes_to_plot={num_routes}",
-        "expand_purchasable_target=True",
-    ]
-
-    # 创建结果目录（带时间戳）
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    results_dir = Path(f"/home/liwenlong/retro_mcts_results/SimpRetro_{timestamp}")
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    # 更新 argv 中的 results_dir
-    argv = [arg if not arg.startswith("results_dir=") else f"results_dir={results_dir}" for arg in argv]
-
-    # 保存任务信息
-    with search_tasks_lock:
-        search_tasks[task_id] = {
-            "status": "running",
-            "smiles": smiles,
-            "results_dir": str(results_dir),
-            "start_time": datetime.now().isoformat(),
-            "argv": argv
-        }
-
-    # 在后台运行搜索
-    def run_search():
-        try:
-            print(f"[SEARCH] Running search.py with argv: {argv}")
-            # 导入并运行主搜索函数
-            from syntheseus.cli.search import main as search_main
-            import sys
-
-            # 保存原始 sys.argv
-            original_argv = sys.argv
-
-            # 设置新的 argv
-            sys.argv = ["search.py"] + argv
-
-            try:
-                # 运行搜索
-                search_main()
-                with search_tasks_lock:
-                    search_tasks[task_id]["status"] = "completed"
-                    search_tasks[task_id]["end_time"] = datetime.now().isoformat()
-                    # 查找实际的结果目录（search.py 会创建带时间戳的子目录）
-                    parent_dir = Path(search_tasks[task_id]["results_dir"])
-                    # 查找包含 route_*.json 的子目录
-                    actual_results_dir = None
-                    for subdir in parent_dir.iterdir():
-                        if subdir.is_dir() and list(subdir.glob("route_*.json")):
-                            actual_results_dir = str(subdir)
-                            break
-                    if actual_results_dir:
-                        search_tasks[task_id]["results_dir"] = actual_results_dir
-                        print(f"[SEARCH] Actual results dir: {actual_results_dir}")
-                print(f"[SEARCH] Task {task_id} completed")
-            except Exception as e:
-                with search_tasks_lock:
-                    search_tasks[task_id]["status"] = "failed"
-                    search_tasks[task_id]["error"] = str(e)
-                print(f"[SEARCH] Task {task_id} failed: {e}")
-            finally:
-                # 恢复原始 sys.argv
-                sys.argv = original_argv
-
-        except Exception as e:
-            print(f"[SEARCH] Failed to import search module: {e}")
-            with search_tasks_lock:
-                search_tasks[task_id]["status"] = "failed"
-                search_tasks[task_id]["error"] = str(e)
-
-    # 在后台线程运行
-    thread = threading.Thread(target=run_search)
-    thread.daemon = True
-    thread.start()
-
-    return {
-        "task_id": task_id,
-        "status": "running",
-        "message": f"Search started for SMILES: {smiles}"
-    }
-
-
-@app.get("/api/search/status/{task_id}")
-async def get_search_status(task_id: str):
-    """
-    查询搜索任务状态
-
-    Args:
-        task_id: 任务 ID
-
-    Returns:
-        包含任务状态的字典
-    """
-    with search_tasks_lock:
-        if task_id not in search_tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        task = search_tasks[task_id].copy()
-
-    # 如果任务完成，返回结果路径
-    result = {
-        "task_id": task_id,
-        "status": task["status"],
-        "smiles": task["smiles"]
-    }
-
-    if task["status"] == "completed":
-        result["results_dir"] = task["results_dir"]
-        # 检查生成的文件
-        results_dir = Path(task["results_dir"])
-        route_files = list(results_dir.glob("route_*.json"))
-        result["num_routes"] = len(route_files)
-
-    elif task["status"] == "failed":
-        result["error"] = task.get("error", "Unknown error")
-
-    return result
-
-
+'''
 @app.get("/api/results/paths")
 async def get_all_paths(results_dir: str = Query(None, description="结果目录路径")):
     """
@@ -541,6 +366,7 @@ async def get_all_paths(results_dir: str = Query(None, description="结果目录
             "total_reactions": len([n for n in merged_route["nodes"] if n.get("type") == "reaction"])
         }
     }
+'''
 
 async def _draw_molecule_smiles(smiles: str, svg: bool, transparent: bool, highlight: bool = False, size: int = 300):
     """绘制单个分子"""
@@ -724,7 +550,7 @@ async def call_tree_search_async(request: dict):
     """
     树搜索控制端点（同步执行）
 
-    整合搜索启动和结果返回功能，返回与 askcos_return1.json 一致的格式。
+    整合搜索启动和结果返回功能，返回与 askcos_return.json 一致的格式。
 
     该端点会：
     1. 接收 SMILES 和搜索参数
@@ -741,7 +567,7 @@ async def call_tree_search_async(request: dict):
             - timeout: 超时时间（秒，默认 300）
 
     Returns:
-        与 askcos_return1.json 一致的 JSON 响应，包含：
+        与 askcos_return.json 一致的 JSON 响应，包含：
         - task_id: 任务 ID
         - state: "SUCCESS" | "FAILED"
         - complete: 是否完成
@@ -751,89 +577,92 @@ async def call_tree_search_async(request: dict):
         - output.result.stats: 统计信息
         - output.result.uds: UDS 格式数据
     """
-    '''
-    global task_counter
 
-    # 提取参数
-    smiles = request.get("smiles", "").strip()
-    if not smiles:
-        raise HTTPException(status_code=400, detail="SMILES is required")
+    max_iterations = glom(request,"build_tree_options.max_iterations",default=1)
+    if max_iterations=="0":
+        global task_counter
 
-    time_limit = request.get("time_limit_s", 30)
-    num_routes = request.get("num_routes", 50)
-    algorithm = request.get("search_algorithm", "mcts")
+        # 提取参数
+        smiles = request.get("smiles", "").strip()
+        if not smiles:
+            raise HTTPException(status_code=400, detail="SMILES is required")
 
-    # 获取 task_id
-    with search_tasks_lock:
-        task_id = f"task_{task_counter}"
-        task_counter += 1
+        time_limit = glom(request,"build_tree_options.expansion_time", default=30)
+        num_routes = glom(request, "build_tree_options.max_branching", default=50)
+        algorithm = glom(request, "backend", default="mcts")
+        model_class = glom(request, "expand_one_options.retro_backend_options.retro_model_name", default="SimpRetro")
+        # 获取 task_id
+        with search_tasks_lock:
+            task_id = f"task_{task_counter}"
+            task_counter += 1
 
-    # 创建结果目录
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    results_dir = Path(f"/home/liwenlong/retro_mcts_results/SimpRetro_{timestamp}")
-    results_dir.mkdir(parents=True, exist_ok=True)
+        # 创建结果目录
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        results_dir = Path(f"/home/liwenlong/retro_mcts_results/SimpRetro_{timestamp}")
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-    # 构建命令行参数
-    argv = [
-        "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-        f"search_target={smiles}",
-        "model_class=SimpRetro",
-        "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-        f"time_limit_s={time_limit}",
-        f"search_algorithm={algorithm}",
-        f"results_dir={results_dir}",
-        "use_gpu=False",
-        f"num_routes_to_plot={num_routes}",
-        "expand_purchasable_target=True",
-        "save_graph=true",
-    ]
+        # 构建命令行参数
+        argv = [
+            "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
+            f"search_target={smiles}",
+            "model_class=SimpRetro",
+            "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
+            f"time_limit_s={time_limit}",
+            f"search_algorithm={algorithm}",
+            f"results_dir={results_dir}",
+            "use_gpu=False",
+            f"num_routes_to_plot={num_routes}",
+            "expand_purchasable_target=True",
+            "save_graph=true",
+        ]
 
-    # 记录开始时间
-    start_time = datetime.now()
+        # 记录开始时间
+        start_time = datetime.now()
 
-    # 同步运行搜索
-    def run_search_sync():
-        from syntheseus.cli.search import main as search_main
-        import sys
-        original_argv = sys.argv
-        sys.argv = ["search.py"] + argv
-        try:
-            search_main()
-            # 查找实际的结果目录
-            for subdir in results_dir.iterdir():
-                if subdir.is_dir() and list(subdir.glob("uds_askcos.json")):
-                    return str(subdir)
-            return str(results_dir)
-        finally:
-            sys.argv = original_argv
+        # 同步运行搜索
+        def run_search_sync():
+            from syntheseus.cli.search import main as search_main
+            import sys
+            original_argv = sys.argv
+            sys.argv = ["search.py"] + argv
+            try:
+                search_main()
+                # 查找实际的结果目录
+                for subdir in results_dir.iterdir():
+                    if subdir.is_dir() and list(subdir.glob("uds_askcos.json")):
+                        return str(subdir)
+                return str(results_dir)
+            finally:
+                sys.argv = original_argv
 
-    # 在线程池中运行搜索
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(run_search_sync)
-        try:
-            # 等待搜索完成
-            timeout = request.get("timeout", 300)
-            actual_results_dir = future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise HTTPException(
-                status_code=408,
-                detail=f"Search timeout after {timeout} seconds"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Search failed: {str(e)}"
-            )
+        # 在线程池中运行搜索
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_search_sync)
+            try:
+                # 等待搜索完成
+                timeout = request.get("timeout", 300)
+                actual_results_dir = future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                raise HTTPException(
+                    status_code=408,
+                    detail=f"Search timeout after {timeout} seconds"
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Search failed: {str(e)}"
+                )
 
-    # 计算搜索时间
-    end_time = datetime.now()
-    build_time = (end_time - start_time).total_seconds()
+        # 计算搜索时间
+        end_time = datetime.now()
+        build_time = (end_time - start_time).total_seconds()
 
-    # 加载 UDS 数据
-    uds_path = Path(actual_results_dir) / "uds_askcos.json"
-    '''
-    uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-04T16:55:57") / "uds_askcos.json"
+        # 加载 UDS 数据
+        uds_path = Path(actual_results_dir) / "uds_askcos.json"
+        print('\n','===========================================\n',uds_path,"\n=================================")
+    else:
+        uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-09T15:38:18/uds_askcos.json")
     if not uds_path.exists():
         raise HTTPException(
             status_code=500,
@@ -870,6 +699,12 @@ async def call_tree_search_async(request: dict):
 
     return response
 
+@app.post("/api/tree-search/expand-one/call-async")
+async def call_tree_search_one(request: dict):
+    raise HTTPException(
+    status_code=500,
+    detail=f"Search failed: 123"
+    )
 
 @app.get("/api/legacy/celery/task/{task_id}")
 async def get_celery_task_status(task_id: str):
@@ -995,5 +830,5 @@ if __name__ == "__main__":
         "api_server:app",
         host="0.0.0.0",
         port=5001,
-        reload=False  # 关闭 reload 以避免路径问题
+        reload=True  # 关闭 reload 以避免路径问题
     )

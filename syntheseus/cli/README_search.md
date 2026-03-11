@@ -90,6 +90,7 @@ SearchConfig
 | `prevent_repeat_mol_in_trees` | bool | True | 防止树中重复分子 |
 | `stop_on_first_solution` | bool | False | 找到第一个解后是否停止 |
 | `expand_purchasable_target` | **bool** | **True** | **是否扩展可购买的目标分子** |
+[chemTools/retro_syn/syntheseus/syntheseus/search/mol_inventory.py:70] def is_purchasable
 
 ---
 
