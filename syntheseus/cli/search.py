@@ -532,7 +532,7 @@ def run_from_config(config: SearchConfig) -> Path:
                     output_graph, _ = alg.run_from_mol(target)
                 else:
                     # 后续搜索：在已有图上继续
-                    _, _ = alg.run_from_graph(output_graph)
+                    alg.run_from_graph(output_graph)
 
                 # 恢复原始时间限制
                 alg.time_limit_s = original_time_limit
@@ -1082,6 +1082,7 @@ if __name__ == "__main__":
             "num_routes_to_plot=50",
             "mcts_config.max_expansion_depth=20",
             "expand_purchasable_target=True",
+            "interactive_mode=True",
         ]
         main(argv=argv)
         

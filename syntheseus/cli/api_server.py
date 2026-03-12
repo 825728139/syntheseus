@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -546,7 +546,7 @@ async def get_template_sets():
 
 
 @app.post("/api/tree-search/controller/call-async")
-async def call_tree_search_async(request: dict):
+async def call_tree_search_async(request: dict, http_request: Request):
     """
     树搜索控制端点（同步执行）
 
@@ -597,8 +597,9 @@ async def call_tree_search_async(request: dict):
             task_counter += 1
 
         # 创建结果目录
-        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        results_dir = Path(f"/home/liwenlong/retro_mcts_results/SimpRetro_{timestamp}")
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        timestamp = datetime.now().strftime("%Y-%m-%d")
+        results_dir = Path(f"/home/liwenlong/retro_mcts_results/SimpRetro_{timestamp}_{client_ip}")
         results_dir.mkdir(parents=True, exist_ok=True)
 
         # 构建命令行参数
@@ -662,7 +663,7 @@ async def call_tree_search_async(request: dict):
         uds_path = Path(actual_results_dir) / "uds_askcos.json"
         print('\n','===========================================\n',uds_path,"\n=================================")
     else:
-        uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-09T15:38:18/uds_askcos.json")
+        uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T09:46:20/uds_askcos.json")
     if not uds_path.exists():
         raise HTTPException(
             status_code=500,
