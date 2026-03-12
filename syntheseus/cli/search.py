@@ -649,12 +649,12 @@ def run_from_config(config: SearchConfig) -> Path:
             logger.info(f"Extracting up to {config.num_routes_to_plot} routes for analysis")
 
             # TODO(kmaziarz): Add options to extract a diverse (or otherwise interesting) subset.
-            routes: Iterator = iter_routes_time_order(
-                output_graph, max_routes=config.num_routes_to_plot
-            )
-            # routes: Iterator = iter_routes_cost_order(
+            # routes: Iterator = iter_routes_time_order(
             #     output_graph, max_routes=config.num_routes_to_plot
             # )
+            routes: Iterator = iter_routes_cost_order(
+                output_graph, max_routes=config.num_routes_to_plot
+            )
 
             # 初始化 UDS 格式字典
             uds = {
@@ -1075,7 +1075,7 @@ if __name__ == "__main__":
             "search_target=C1=COC(/C=C2/C(=O)C3=C(C/2=O)C=CC=C3)=C1",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=10",
+            "time_limit_s=200",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",

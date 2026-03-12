@@ -131,9 +131,12 @@ def _iter_top_routes(
 
 
 def _route_has_solution(nodes: Collection[BaseGraphNode], graph: RetrosynthesisSearchGraph) -> bool:
-    """Whether a route is solved, calculated without in-place modification of the nodes."""
-    subgraph = graph._graph.subgraph(nodes)
-    node_to_soln = {node: node._has_intrinsic_solution() for node in nodes}
+    """
+    Whether a route is solved, calculated without in-place modification of the nodes.
+    判断一条合成路径是否完全可解（能到达所有可购买分子）
+    """
+    subgraph = graph._graph.subgraph(nodes) # 从完整图中提取只包含指定节点的子图
+    node_to_soln = {node: node._has_intrinsic_solution() for node in nodes} # 针对mcts,molset.py:39 {node: mol.metadata["is_purchasable"]}
 
     # Iterate to update unsolved nodes
     was_update = True
@@ -142,9 +145,9 @@ def _route_has_solution(nodes: Collection[BaseGraphNode], graph: RetrosynthesisS
         for node in list(node_to_soln):
             if not node_to_soln[node]:  # only update unsolved nodes
                 if isinstance(node, (OrNode, MolSetNode)):
-                    node_to_soln[node] = any(node_to_soln[c] for c in subgraph.successors(node))
+                    node_to_soln[node] = any(node_to_soln[c] for c in subgraph.successors(node))    # node的子节点有一个可解，则node可解
                 elif isinstance(node, AndNode):
-                    node_to_soln[node] = all(node_to_soln[c] for c in subgraph.successors(node))
+                    node_to_soln[node] = all(node_to_soln[c] for c in subgraph.successors(node))    # node的子节点全部可解，则node可解
                 else:
                     raise TypeError
                 was_update = was_update or node_to_soln[node]
@@ -247,205 +250,3 @@ def iter_routes_time_order(
         yield_partial_routes=False,
     ):
         yield r
-
-
-# ============================================================================
-# Confidence-based route extraction functions
-# ============================================================================
-
-
-def _get_reactions_from_route(
-    route: Collection[BaseGraphNode], graph: RetrosynthesisSearchGraph
-) -> list[SingleProductReaction]:
-    """
-    从路径节点中提取所有反应对象。
-
-    兼容 MolSetGraph (反应在边上) 和 AndOrGraph (反应在 AndNode 中)。
-
-    Args:
-        route: 路径节点集合
-        graph: 搜索图
-
-    Returns:
-        反应对象列表
-    """
-    reactions = []
-
-    if isinstance(graph, AndOrGraph):
-        # AndOrGraph: 反应存储在 AndNode 中
-        for node in route:
-            if isinstance(node, AndNode):
-                reactions.append(node.reaction)
-    elif isinstance(graph, MolSetGraph):
-        # MolSetGraph: 反应存储在边上
-        route_list = list(route)
-        for i in range(len(route_list) - 1):
-            u, v = route_list[i], route_list[i + 1]
-            edge_data = graph._graph.get_edge_data(u, v)
-            if "reaction" in edge_data:
-                reactions.append(edge_data["reaction"])
-    else:
-        raise TypeError(f"Unsupported graph type: {type(graph)}")
-
-    return reactions
-
-
-def _route_neg_log_prob(
-    nodes: Collection[BaseGraphNode], graph: RetrosynthesisSearchGraph
-) -> float:
-    """
-    计算路径的负对数概率（作为成本，越小=置信度越高）。
-
-    路径概率 = 所有反应概率的乘积
-    负对数概率 = -log(路径概率) = -sum(log(反应概率))
-
-    兼容 MolSetGraph 和 AndOrGraph。
-
-    Args:
-        nodes: 路径节点集合
-        graph: 搜索图
-
-    Returns:
-        负对数概率成本（越小越好），如果路径无解则返回 math.inf
-    """
-    if not _route_has_solution(nodes, graph):
-        return math.inf
-
-    log_prob_sum = 0.0
-    reactions = _get_reactions_from_route(nodes, graph)
-
-    for reaction in reactions:
-        # 优先使用 log_probability
-        if "log_probability" in reaction.metadata:
-            log_prob_sum += reaction.metadata["log_probability"]
-        elif "probability" in reaction.metadata:
-            prob = reaction.metadata["probability"]
-            if prob > 0:
-                log_prob_sum += math.log(prob)
-            else:
-                return math.inf  # 概率为0，路径无效
-
-    return -log_prob_sum  # 负值作为成本（越小越好）
-
-
-def _route_neg_log_prob_partial(
-    nodes: Collection[BaseGraphNode], graph: RetrosynthesisSearchGraph
-) -> float:
-    """部分路径的成本下界（用于搜索优化）。"""
-    if not all(n.has_solution for n in nodes):
-        return math.inf
-
-    log_prob_sum = 0.0
-    reactions = _get_reactions_from_route(nodes, graph)
-
-    for reaction in reactions:
-        if "log_probability" in reaction.metadata:
-            log_prob_sum += reaction.metadata["log_probability"]
-        elif "probability" in reaction.metadata:
-            prob = reaction.metadata["probability"]
-            if prob > 0:
-                log_prob_sum += math.log(prob)
-            else:
-                return math.inf
-
-    return -log_prob_sum
-
-
-def iter_routes_confidence_order(
-    graph: RetrosynthesisSearchGraph,
-    max_routes: int,
-    max_time_s: float = math.inf,
-    min_confidence: Optional[float] = None,
-    return_confidence: bool = False,
-) -> Iterator[Collection[BaseGraphNode]] | Iterator[tuple[float, Collection[BaseGraphNode]]]:
-    """
-    按置信度从高到低提取路径。
-
-    兼容 MolSetGraph (MCTS) 和 AndOrGraph (Retro*, PDVN)。
-
-    Args:
-        graph: 与或图 (AndOrGraph) 或分子集合图 (MolSetGraph)
-        max_routes: 最大路径数
-        max_time_s: 最大提取时间（秒）
-        min_confidence: 最小置信度阈值（0-1），低于此值的路径将被过滤
-        return_confidence: 是否返回置信度值
-
-    Yields:
-        如果 return_confidence=False: 路径节点集合
-        如果 return_confidence=True: (置信度, 路径节点集合) 元组
-
-    Note:
-        置信度计算基于路径中所有反应概率的乘积。
-        在对数空间计算以避免数值下溢。
-    """
-    for cost, route in _iter_top_routes(
-        graph=graph,
-        cost_fn=_route_neg_log_prob,
-        cost_lower_bound=_route_neg_log_prob_partial,
-        max_routes=max_routes,
-        max_time_s=max_time_s,
-        yield_partial_routes=False,
-    ):
-        # 计算实际置信度
-        confidence = math.exp(-cost) if cost < 100 else 0.0
-
-        # 应用最小置信度阈值
-        if min_confidence is not None and confidence < min_confidence:
-            break
-
-        if return_confidence:
-            yield confidence, route
-        else:
-            yield route
-
-
-def get_route_confidence(
-    route: Collection[BaseGraphNode], graph: RetrosynthesisSearchGraph
-) -> float:
-    """
-    计算路径的置信度（所有反应概率的乘积）。
-
-    Args:
-        route: 路径节点集合
-        graph: 搜索图
-
-    Returns:
-        路径置信度（0-1之间）
-    """
-    confidence = 1.0
-    reactions = _get_reactions_from_route(route, graph)
-
-    for reaction in reactions:
-        prob = reaction.metadata.get("probability", 1.0)
-        confidence *= prob
-
-    return confidence
-
-
-def get_route_log_confidence(
-    route: Collection[BaseGraphNode], graph: RetrosynthesisSearchGraph
-) -> float:
-    """
-    计算路径的对数置信度（所有反应对数概率的和）。
-
-    Args:
-        route: 路径节点集合
-        graph: 搜索图
-
-    Returns:
-        路径对数置信度（负数，绝对值越大=置信度越低）
-    """
-    log_confidence = 0.0
-    reactions = _get_reactions_from_route(route, graph)
-
-    for reaction in reactions:
-        if "log_probability" in reaction.metadata:
-            log_confidence += reaction.metadata["log_probability"]
-        elif "probability" in reaction.metadata:
-            prob = reaction.metadata["probability"]
-            if prob > 0:
-                log_confidence += math.log(prob)
-            else:
-                return -math.inf
-
-    return log_confidence

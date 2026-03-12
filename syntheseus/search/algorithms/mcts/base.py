@@ -223,6 +223,7 @@ class BaseMCTS(
                 policy_values = self.policy(children, graph)
                 for child, policy_value in zip(children, policy_values):
                     child.data["policy_score"] = policy_value
+                    child.data["route_cost"] = -math.log(policy_value)
             del children
 
             # Immediately set node values in case rewards depend on them

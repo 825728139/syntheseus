@@ -241,7 +241,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                         + w2 * asscore
                         + w3 * rdscore          # 返回值0或1
                         + w4 * mdscore     # 计算预测反应物个数的倒数
-                        + 0.1 * (20 if template_raw in self.private_templates else 0)   # 如果模板在私有模板列表中，则增加5分
+                        + 0.1 * (10 if template_raw in self.private_templates else 0)   # 如果模板在私有模板列表中，则增加5分
                     )
                     # if score > 0:
                     #     print(f"CDScore: {cdscore}, ASScore: {asscore}, RDScore: {rdscore}, MDScore: {mdscore}, Overall Score: {score}")
@@ -306,3 +306,4 @@ class SimpRetroModel(ExternalBackwardReactionModel):
             )
             for input, output in zip(inputs, raw_outputs)
         ]
+        # 虽然这里使用的变量名叫pred、probability，但其输出与其叫反应发生成功率，不如叫模板价值，神经网络应为排除低价值模板产生的合成路径
