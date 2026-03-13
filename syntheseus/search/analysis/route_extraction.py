@@ -22,6 +22,7 @@ def _iter_top_routes(
     max_routes: int,
     max_time_s: float = math.inf,
     yield_partial_routes: bool = False,
+    only_new_nodes: bool = False,
 ) -> Iterator[tuple[float, Collection[NodeType]]]:
     """
     Iterator over the minimal trees (routes) with lowest cost.
@@ -75,6 +76,14 @@ def _iter_top_routes(
         # because its cost must be lower than the partial cost of all other routes.
         if is_true_cost:
             assert len(route_frontier) == 0
+
+            # 检查是否只返回包含新节点的路径
+            if only_new_nodes:
+                leaf_nodes = [n for n in partial_route if list(graph.successors(n))]
+                if not any(getattr(n, '_is_new_node', False) for n in leaf_nodes):
+                    num_routes_yielded += 1  # 跳过的路径也计入计数
+                    continue  # 跳过没有新节点的路径
+
             yield (cost, partial_route)
             num_routes_yielded += 1
         else:
@@ -176,6 +185,7 @@ def iter_routes_cost_order(
     max_routes: int,
     max_time_s: float = math.inf,
     stop_cost: Optional[float] = None,
+    only_new_nodes: bool = False,
 ) -> Iterator[Collection[BaseGraphNode]]:
     """
     Iterate over all solved routes from `graph` in order of increasing cost.
@@ -199,6 +209,7 @@ def iter_routes_cost_order(
         max_routes=max_routes,
         max_time_s=max_time_s,
         yield_partial_routes=False,
+        only_new_nodes=only_new_nodes,
     ):
         if stop_cost is not None and cost >= stop_cost:
             break

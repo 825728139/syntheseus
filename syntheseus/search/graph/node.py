@@ -93,6 +93,10 @@ class BaseGraphNode(abc.ABC):
     # while also allowing type-checking.
     data: NodeData = field(default_factory=lambda: NodeData())
 
+    # Temporary marker to indicate if this is a newly created node.
+    # This will not be serialized to pickle files.
+    _is_new_node: bool = field(default=False, init=False, repr=False, compare=False)
+
     def __eq__(self, other):
         # No comparison of node values, only identity.
         return self is other
@@ -111,3 +115,14 @@ class BaseGraphNode(abc.ABC):
     def _has_solution_from_children(self, children: Collection[BaseGraphNode]) -> bool:
         """Whether this node has a solution, exclusively considering its children."""
         raise NotImplementedError
+
+    def __getstate__(self):
+        """Return state for serialization, excluding temporary markers."""
+        state = self.__dict__.copy()
+        state.pop('_is_new_node', None)
+        return state
+
+    def __setstate__(self, state):
+        """Restore object from deserialization."""
+        self.__dict__.update(state)
+        self._is_new_node = False  # Deserialized nodes are not considered new

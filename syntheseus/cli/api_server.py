@@ -30,9 +30,6 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 import io
 
-# 导入数据格式转换模块
-from data_adapter import convert_to_askcos_format
-
 # RDKit 绘图模块（仅在可用时导入）
 try:
     from rdkit import Chem
@@ -627,11 +624,7 @@ async def call_tree_search_async(request: dict, http_request: Request):
             original_argv = sys.argv
             sys.argv = ["search.py"] + argv
             try:
-                search_main()
-                # 查找实际的结果目录
-                for subdir in results_dir.iterdir():
-                    if subdir.is_dir() and list(subdir.glob("uds_askcos.json")):
-                        return str(subdir)
+                results_dir = search_main()
                 return str(results_dir)
             finally:
                 sys.argv = original_argv
@@ -663,7 +656,7 @@ async def call_tree_search_async(request: dict, http_request: Request):
         uds_path = Path(actual_results_dir) / "uds_askcos.json"
         print('\n','===========================================\n',uds_path,"\n=================================")
     else:
-        uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T09:46:20/uds_askcos.json")
+        uds_path = Path("/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T17:37:38/uds_askcos.json")
     if not uds_path.exists():
         raise HTTPException(
             status_code=500,

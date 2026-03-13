@@ -75,48 +75,6 @@ logger = logging.getLogger(__file__)
 # ============================================================================
 
 
-class RouteTracker:
-    """追踪已输出的路径，避免重复显示."""
-
-    def __init__(self) -> None:
-        self.shown_route_hashes: set[str] = set()
-
-    def _hash_route(self, route: set) -> str:
-        """计算路径的哈希值用于去重."""
-        # 使用节点ID的排序元组作为哈希
-        node_ids = sorted([id(node) for node in route])
-        return str(tuple(node_ids))
-
-    def get_new_routes(
-        self,
-        graph: AndOrGraph | MolSetGraph,
-        max_routes: int,
-    ) -> list[set]:
-        """获取新发现的路径.
-
-        Args:
-            graph: 搜索图
-            max_routes: 最大返回路径数
-
-        Returns:
-            新发现的路径列表（每个路径是一个节点集合）
-        """
-        new_routes = []
-
-        for route in iter_routes_time_order(graph, max_routes=max_routes * 2):
-            # 这里我们多获取一些路径，然后过滤出新的
-            route_hash = self._hash_route(route)
-
-            if route_hash not in self.shown_route_hashes:
-                new_routes.append(route)
-                self.shown_route_hashes.add(route_hash)
-
-                if len(new_routes) >= max_routes:
-                    break
-
-        return new_routes
-
-
 def print_interim_stats(
     graph: AndOrGraph | MolSetGraph,
     iteration: int,
@@ -161,53 +119,6 @@ def print_interim_stats(
 
     if has_solution and num_solutions > 0:
         print(f"已发现解的数量: {num_solutions}")
-
-
-def extract_and_plot_routes(
-    graph: AndOrGraph | MolSetGraph,
-    results_dir: Path,
-    route_tracker: RouteTracker,
-    max_routes: int,
-    iteration: int,
-) -> int:
-    """提取并绘制路径（仅新路径）.
-
-    Args:
-        graph: 搜索图
-        results_dir: 结果目录
-        route_tracker: 路径追踪器
-        max_routes: 最大绘制路径数
-        iteration: 当前迭代次数
-
-    Returns:
-        新发现的路径数量
-    """
-    if not VISUALIZATION_CODE_IMPORTED:
-        logger.warning("可视化代码未导入，跳过路径绘制")
-        return 0
-
-    # 获取新路径
-    new_routes = route_tracker.get_new_routes(graph, max_routes)
-
-    for route_idx, route in enumerate(new_routes):
-        route_file_idx = iteration * max_routes + route_idx
-        with open(results_dir / f"route_{route_file_idx}.pkl", "wb") as f_route:
-            pickle.dump(route, f_route)
-
-        visualize_kwargs: Dict[str, Any] = dict(
-            graph=graph,
-            filename=str(results_dir / f"route_{route_file_idx}.pdf"),
-            nodes=route,
-        )
-
-        if isinstance(graph, AndOrGraph):
-            visualize_andor(**visualize_kwargs)
-        elif isinstance(graph, MolSetGraph):
-            visualize_molset(**visualize_kwargs)
-        else:
-            assert False
-
-    return len(new_routes)
 
 
 @dataclass
@@ -352,17 +263,51 @@ class BaseSearchConfig(SearchAlgorithmConfig):
     save_graph: bool = True  # Whether to save the full reaction graph (can be large)
     num_routes_to_plot: int = 5  # Number of routes to extract and plot for a quick check
 
-    # Fields configuring interactive incremental search mode
-    interactive_mode: bool = False  # Whether to enable interactive incremental search
-    increment_time_s: float = 30.0  # Time per search increment in interactive mode
-    max_continues: int = 10  # Maximum number of continue prompts in interactive mode
-
+    # Fields for resume search mode
+    resume_search: Optional[str] = None  # Path to existing search results folder to resume from
+    resume_search_time_s: float = 30.0  # Time limit for resumed search (default 30 seconds)
 
 @dataclass
 class SearchConfig(BackwardModelConfig, BaseSearchConfig):
     """Config for running search for given search targets."""
 
     pass
+
+
+def merge_uds_data(old_uds: dict, new_uds: dict) -> dict:
+    """合并新旧 UDS 数据（直接合并，不排序）
+
+    Args:
+        old_uds: 旧的 UDS 数据（包含 node_dict, graph, pathways, pathways_properties, uuid2smiles）
+        new_uds: 新的 UDS 数据（相同结构）
+
+    Returns:
+        合并后的 UDS 数据
+    """
+    if not old_uds:
+        return new_uds
+    if not new_uds:
+        return old_uds
+
+    # 合并 node_dict（新节点信息）
+    merged_node_dict = {**old_uds.get('node_dict', {}), **new_uds.get('node_dict', {})}
+
+    # 合并 graph（路径到节点的映射关系）
+    merged_graph = old_uds.get('graph', []) + new_uds.get('graph', [])
+
+    # 合并 uuid2smiles
+    merged_uuid2smiles = {**old_uds.get('uuid2smiles', {}), **new_uds.get('uuid2smiles', {})}
+
+    # 合并 pathways 和 pathways_properties
+    merged_uds = {
+        'node_dict': merged_node_dict,
+        'graph': merged_graph,
+        'pathways': old_uds.get('pathways', []) + new_uds.get('pathways', []),
+        'pathways_properties': old_uds.get('pathways_properties', []) + new_uds.get('pathways_properties', []),
+        'uuid2smiles': merged_uuid2smiles,
+    }
+
+    return merged_uds
 
 
 def run_from_config(config: SearchConfig) -> Path:
@@ -437,173 +382,88 @@ def run_from_config(config: SearchConfig) -> Path:
         **search_algorithm_config_to_kwargs(config),
     )
 
-    # Prepare the output directory
-    results_dir_top_level = Path(config.results_dir)
+    # 初始化恢复模式标志变量
+    is_resume_mode = False
+    # 检查是否存在之前的搜索结果以恢复
+    if config.resume_search is None or not (Path(config.resume_search) / "graph.pkl").exists():
+        # 运行旧有的搜索逻辑（从头开始）
+        logger.info("No existing search graph found, starting a new search")
+        # Prepare the output directory
+        results_dir_top_level = Path(config.results_dir)
 
-    dirname = config.model_class.name
-    if config.append_timestamp_to_dir:
-        timestamp = datetime.datetime.now().isoformat(timespec="seconds")
-        dirname += f"_{str(timestamp)}"
+        dirname = config.model_class.name
+        if config.append_timestamp_to_dir:
+            timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+            dirname += f"_{str(timestamp)}"
 
-    results_dir_current_run = results_dir_top_level / dirname
+        results_dir_current_run = results_dir_top_level / dirname
 
-    # 添加文件日志处理器
-    results_dir_current_run.mkdir(parents=True, exist_ok=True)
-    log_file = results_dir_current_run / "search.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(log_formatter)
-    root_logger.addHandler(file_handler)
+        # 添加文件日志处理器
+        results_dir_current_run.mkdir(parents=True, exist_ok=True)
+        log_file = results_dir_current_run / "search.log"
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(log_formatter)
+        root_logger.addHandler(file_handler)
 
-    logger.info(f"日志文件将保存到: {log_file}")
-    logger.info("Setup completed")
-    num_targets = len(search_targets)
+        logger.info(f"日志文件将保存到: {log_file}")
+        logger.info("Setup completed")
+        num_targets = len(search_targets)
 
-    all_stats: List[Dict[str, Any]] = []
-    for idx, smiles in enumerate(tqdm(search_targets)):
-        logger.info(f"Running search for target {smiles}")
+        all_stats: List[Dict[str, Any]] = []
+        for idx, smiles in enumerate(tqdm(search_targets)):
+            logger.info(f"Running search for target {smiles}")
 
-        if num_targets == 1:
-            results_dir = results_dir_current_run
-        else:
-            results_dir = results_dir_current_run / str(idx)
-
-        results_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Outputs will be saved under {results_dir}")
-
-        results_lock_path = results_dir / ".lock"
-        results_stats_path = results_dir / "stats.json"
-
-        if results_lock_path.exists():
-            paths = [path for path in results_dir.iterdir() if path.is_file()]
-            logger.warning(
-                f"Lockfile was found which means the last run failed, purging {len(paths)} files"
-            )
-
-            for path in paths:
-                path.unlink()
-        elif results_stats_path.exists():
-            with open(results_stats_path, "rt") as f_stats:
-                stats = json.load(f_stats)
-                if stats.get("index") != idx or stats.get("smiles") != smiles:
-                    raise RuntimeError(
-                        f"Data present under {results_dir} does not match the current run"
-                    )
-
-                all_stats.append(stats)
-
-            logger.info("Search results already exist, skipping")
-            continue
-
-        results_lock_path.touch()
-
-        target = Molecule(smiles)
-        target_in_inventory = mol_inventory.is_purchasable(target)
-
-        if target_in_inventory:
-            if config.expand_purchasable_target:
-                logger.info("Target is purchasable but will be expanded anyway")
+            if num_targets == 1:
+                results_dir = results_dir_current_run
             else:
-                logger.info(
-                    "Search will be a no-op as the target is purchasable; "
-                    "set `expand_purchasable_target` if you want to expand it regardless"
+                results_dir = results_dir_current_run / str(idx)
+
+            # results_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Outputs will be saved under {results_dir}")
+
+            results_lock_path = results_dir / ".lock"
+            results_stats_path = results_dir / "stats.json"
+
+            if results_lock_path.exists():
+                paths = [path for path in results_dir.iterdir() if path.is_file()]
+                logger.warning(
+                    f"Lockfile was found which means the last run failed, purging {len(paths)} files"
                 )
 
-        # ============================================================
-        # 搜索执行：支持交互式增量搜索模式
-        # ============================================================
-        if config.interactive_mode:
-            # 交互模式：增量搜索，每次 increment_time_s 秒
-            increment_time_s = config.increment_time_s
-            max_continues = config.max_continues
+                for path in paths:
+                    path.unlink()
+            elif results_stats_path.exists():
+                with open(results_stats_path, "rt") as f_stats:
+                    stats = json.load(f_stats)
+                    if stats.get("index") != idx or stats.get("smiles") != smiles:
+                        raise RuntimeError(
+                            f"Data present under {results_dir} does not match the current run"
+                        )
 
-            alg.reset()
-            output_graph = None
-            total_search_time = 0.0
-            route_tracker = RouteTracker()
+                    all_stats.append(stats)
 
-            for iteration in range(max_continues):
-                # 设置本次搜索的时间限制
-                original_time_limit = alg.time_limit_s
-                alg.time_limit_s = increment_time_s
+                logger.info("Search results already exist, skipping")
+                continue
 
-                if output_graph is None:
-                    # 第一次搜索：从分子开始
-                    output_graph, _ = alg.run_from_mol(target)
+            results_lock_path.touch()
+
+            target = Molecule(smiles)
+            target_in_inventory = mol_inventory.is_purchasable(target)
+
+            if target_in_inventory:
+                if config.expand_purchasable_target:
+                    logger.info("Target is purchasable but will be expanded anyway")
                 else:
-                    # 后续搜索：在已有图上继续
-                    alg.run_from_graph(output_graph)
-
-                # 恢复原始时间限制
-                alg.time_limit_s = original_time_limit
-
-                total_search_time += increment_time_s
-
-                # ===== 完整输出（交互模式下） =====
-                print(f"\n{'='*60}")
-                print(f"已搜索 {total_search_time:.1f} 秒 (第 {iteration+1} 轮)")
-                print(f"{'='*60}")
-
-                # 1. 统计信息
-                print_interim_stats(
-                    output_graph, iteration, total_search_time,
-                    alg.reaction_model, target, mol_inventory
-                )
-
-                # 2. 提取并绘制新发现的路径
-                if config.num_routes_to_plot > 0:
-                    new_routes_count = extract_and_plot_routes(
-                        output_graph, results_dir, route_tracker,
-                        config.num_routes_to_plot, iteration
+                    logger.info(
+                        "Search will be a no-op as the target is purchasable; "
+                        "set `expand_purchasable_target` if you want to expand it regardless"
                     )
-                    print(f"本轮新发现路径: {new_routes_count} 条")
 
-                # 3. 询问是否继续
-                if iteration < max_continues - 1:
-                    try:
-                        user_input = input("\n是否继续搜索 {:.0f} 秒？(y/n): ".format(increment_time_s)).strip().lower()
-                        if user_input != 'y':
-                            print(f"\n搜索结束，总用时: {total_search_time:.1f} 秒")
-                            break
-                    except (EOFError, KeyboardInterrupt):
-                        # 处理用户中断（Ctrl+C 或 Ctrl+D）
-                        print(f"\n\n用户中断，搜索结束。总用时: {total_search_time:.1f} 秒")
-                        break
-            # 交互模式结束
-            logger.info(f"Finished interactive search for target {smiles}, total time: {total_search_time:.1f}s")
-        else:
-            # 非交互模式：保持原有行为
+            # 保持原有行为
             alg.reset()
             output_graph, _ = alg.run_from_mol(target)
             logger.info(f"Finished search for target {smiles}")
-
-        # Time of first solution (rxn model calls)
-        for node in output_graph.nodes():
-            node.data["analysis_time"] = node.data["num_calls_rxn_model"]
-        soln_time_rxn_model_calls = get_first_solution_time(output_graph)
-
-        # Time of first solution (wallclock)
-        for node in output_graph.nodes():
-            node.data["analysis_time"] = (
-                node.creation_time - output_graph.root_node.creation_time
-            ).total_seconds()
-        soln_time_wallclock = get_first_solution_time(output_graph)
-
-        stats = {
-            "index": idx,
-            "smiles": smiles,
-            "target_in_inventory": target_in_inventory,
-            "rxn_model_calls_used": alg.reaction_model.num_calls(),
-            "num_nodes_in_final_tree": len(output_graph),
-            "soln_time_rxn_model_calls": soln_time_rxn_model_calls,
-            "soln_time_wallclock": soln_time_wallclock,
-        }
-
-        all_stats.append(stats)
-        logger.info(pformat(stats))
-
-        with open(results_stats_path, "wt") as f_stats:
-            f_stats.write(json.dumps(stats, indent=2))
 
         if config.save_graph:
             from json_graph import serialize_node, serialize_reaction
@@ -644,18 +504,113 @@ def run_from_config(config: SearchConfig) -> Path:
             with open(results_dir / "graph.pkl", "wb") as f_graph:
                 pickle.dump(output_graph, f_graph)
 
-        if config.num_routes_to_plot > 0:
-            # Extract some synthesis routes in the order they were found
-            logger.info(f"Extracting up to {config.num_routes_to_plot} routes for analysis")
+    else:
+        # 集成恢复搜索功能
+        results_dir = Path(config.resume_search)
+        graph_pkl = results_dir / "graph.pkl"
+        logger.info(f"Resume mode: loading graph from {graph_pkl}")
 
-            # TODO(kmaziarz): Add options to extract a diverse (or otherwise interesting) subset.
-            # routes: Iterator = iter_routes_time_order(
-            #     output_graph, max_routes=config.num_routes_to_plot
-            # )
+        # 加载之前的搜索图和输出结果
+        with open(graph_pkl, "rb") as f:
+            output_graph = pickle.load(f)
+        uds_json = results_dir / "uds_askcos.json"
+        if uds_json.exists():
+            with open(uds_json, "r") as f:
+                resume_old_uds = json.load(f)
+            logger.info(f"Loaded {len(resume_old_uds.get('pathways', []))} existing pathways")
+        else:
+            resume_old_uds = None
+            logger.info("No existing UDS data found, starting with empty UDS")
+        resume_routes_num = len(resume_old_uds.get('pathways', [])) if resume_old_uds else 0
+        alg.run_from_graph(output_graph)
+
+        # 匹配兼容变量名，准备后续处理
+        results_dir_current_run = results_dir
+        results_lock_path = results_dir / ".lock"
+        results_lock_path.touch()
+        results_stats_path = results_dir / "stats.json"
+        all_stats: List[Dict[str, Any]] = []
+        root_node = output_graph._root_node
+        if hasattr(root_node, 'mol'):
+            # AndOrGraph (retro_star)
+            root_smiles = root_node.mol.smiles
+        elif hasattr(root_node, 'mols'):
+            # MolSetGraph (MCTS)
+            root_smiles = list(root_node.mols)[0].smiles if len(root_node.mols) == 1 else None
+            if root_smiles is None:
+                root_smiles = ','.join(sorted([mol.smiles for mol in root_node.mols]))
+        else:
+            root_smiles = None
+
+        # 恢复搜索：设置标志变量，供后续共享代码使用
+        is_resume_mode = True
+
+    # Time of first solution (rxn model calls)
+    for node in output_graph.nodes():
+        node.data["analysis_time"] = node.data["num_calls_rxn_model"]
+    soln_time_rxn_model_calls = get_first_solution_time(output_graph)
+
+    # Time of first solution (wallclock)
+    for node in output_graph.nodes():
+        node.data["analysis_time"] = (
+            node.creation_time - output_graph.root_node.creation_time
+        ).total_seconds()
+    soln_time_wallclock = get_first_solution_time(output_graph)
+
+    stats = {
+        "index": "resume" if is_resume_mode else idx,
+        "smiles": "resume" if is_resume_mode else smiles,
+        "target_in_inventory": "resume" if is_resume_mode else target_in_inventory,
+        "rxn_model_calls_used": alg.reaction_model.num_calls(),
+        "num_nodes_in_final_tree": len(output_graph),
+        "soln_time_rxn_model_calls": soln_time_rxn_model_calls,
+        "soln_time_wallclock": soln_time_wallclock,
+    }
+
+    all_stats.append(stats)
+    logger.info(pformat(stats))
+    if results_stats_path.exists():
+        results_stats_path = results_stats_path.with_suffix(".jsonl")
+        logger.info(f"Stats file already exists, appending to {results_stats_path}")
+    with open(results_stats_path, "wt") as f_stats:
+        f_stats.write(json.dumps(stats, indent=2))
+
+    if config.num_routes_to_plot > 0:
+        # Extract some synthesis routes in the order they were found
+        logger.info(f"Extracting up to {config.num_routes_to_plot} routes for analysis")
+
+        # TODO(kmaziarz): Add options to extract a diverse (or otherwise interesting) subset.
+        # routes: Iterator = iter_routes_time_order(
+        #     output_graph, max_routes=config.num_routes_to_plot
+        # )
+
+        # 恢复模式：只提取包含新节点的路径
+        skip_uds_processing = False  # 标志：是否跳过 UDS 处理
+        if is_resume_mode:
+            routes: Iterator = iter_routes_cost_order(
+                output_graph, max_routes=config.num_routes_to_plot, only_new_nodes=True
+            )
+            routes = list(routes)  # 转换为列表以检查数量
+            logger.info(f"Resume mode: found {len(routes)} new routes")
+
+            # 如果没有新路径，只保存 graph.pkl，跳过后续 UDS 处理
+            if len(routes) == 0:
+                logger.info("No new routes found, only saving updated graph.pkl")
+                with open(results_dir / "graph.pkl", "wb") as f_graph:
+                    pickle.dump(output_graph, f_graph)
+                skip_uds_processing = True
+        else:
             routes: Iterator = iter_routes_cost_order(
                 output_graph, max_routes=config.num_routes_to_plot
             )
+            routes = list(routes)
 
+        # 如果跳过 UDS 处理，直接清理并进入下一个目标
+        if skip_uds_processing:
+            results_lock_path.unlink()
+            del results_dir
+        else:
+            # 正常处理 UDS（原有代码）
             # 初始化 UDS 格式字典
             uds = {
                 "node_dict": {},      # {smiles: node_info}
@@ -666,7 +621,6 @@ def run_from_config(config: SearchConfig) -> Path:
             }
             global_smiles_to_uuid = {}  # 全局 SMILES 到 UUID 的映射
             ROOT_UUID = "00000000-0000-0000-0000-000000000000"
-            routes = list(routes)
 
             # 获取根节点 SMILES（目标分子）添加到 node_dict
             root_node = list(routes[0])[0]
@@ -676,7 +630,7 @@ def run_from_config(config: SearchConfig) -> Path:
                 root_molecule = list(root_node.mols)[0]
             else:
                 root_molecule = None
-            
+        
             uds["node_dict"][root_molecule.smiles] = {
                 "smiles": root_molecule.smiles,
                 "as_reactant": 1,
@@ -691,7 +645,9 @@ def run_from_config(config: SearchConfig) -> Path:
             global_smiles_to_uuid[root_molecule.smiles] = ROOT_UUID
             uds["uuid2smiles"][ROOT_UUID] = root_molecule.smiles
 
+            resume_routes_num = len(resume_old_uds.get('pathways', [])) if resume_old_uds else 0
             for route_idx, route in enumerate(routes):
+                route_idx += resume_routes_num  # 如果是恢复模式，继续之前的索引
                 # 初始化当前路径的 SMILES 到 UUID 映射
                 pathway_smiles_to_uuid = {}
                 pathway_edges = []
@@ -704,9 +660,9 @@ def run_from_config(config: SearchConfig) -> Path:
                     for i in range(len(route_list) - 1):
                         u, v = route_list[i], route_list[i + 1]
                         edge_data = output_graph._graph.get_edge_data(u, v)
-                        
+                    
                         node_depth = i+1
-                        
+                    
                         if edge_data and "reaction" in edge_data:
                             reaction = edge_data["reaction"]
                             rxn_smiles = reaction.reaction_smiles
@@ -897,7 +853,19 @@ def run_from_config(config: SearchConfig) -> Path:
                                                  'template': template}
                                 }
                             })
+                # 添加到 UDS pathways 和 pathways_properties
+                if pathway_edges:
+                    uds["pathways"].append(pathway_edges)
+                    # 计算路径深度
+                    max_depth = max(node.depth for node in route_list)
+                    uds["pathways_properties"].append({
+                        "depth": max_depth,
+                        "precursor_cost": "precursor_cost",
+                        "score": None,
+                        "cluster_id": None
+                    })
 
+                # 单独可视化 route
                 # 序列化节点（保留原有逻辑用于单独的 route 文件）
                 serialized_nodes = []
                 node_id_to_index = {}
@@ -905,7 +873,7 @@ def run_from_config(config: SearchConfig) -> Path:
                     node_id = str(id(node))
                     node_id_to_index[node_id] = idx
 
-                    # 手动序列化节点（不依赖 json_graph）
+                    # 手动序列化节点
                     serialized_node = {
                         'id': node_id,
                         'has_solution': node.has_solution,
@@ -954,21 +922,9 @@ def run_from_config(config: SearchConfig) -> Path:
                     'num_edges': len(route_edges)
                 }
 
-                # 保存为 JSON（用于前端展示）
+                # 保存为 JSON（用于调试查看数据）
                 with open(results_dir / f"route_{route_idx}.json", "w") as f_route:
                     json.dump(route_data, f_route, indent=2, ensure_ascii=False)
-
-                # 添加到 UDS pathways 和 pathways_properties
-                if pathway_edges:
-                    uds["pathways"].append(pathway_edges)
-                    # 计算路径深度
-                    max_depth = max(node.depth for node in route_list)
-                    uds["pathways_properties"].append({
-                        "depth": max_depth,
-                        "precursor_cost": "precursor_cost",
-                        "score": None,
-                        "cluster_id": None
-                    })
 
                 visualize_kwargs: Dict[str, Any] = dict(
                     graph=output_graph,
@@ -984,7 +940,21 @@ def run_from_config(config: SearchConfig) -> Path:
                     assert False
 
             # 生成 UDS Askcos 格式输出
-            if config.save_graph:
+            if is_resume_mode:
+                # 恢复模式：保存 new_uds.json 并合并到 uds_askcos.json
+                new_uds_file = results_dir / "new_uds.json"
+                with open(new_uds_file, "w") as f_uds:
+                    json.dump(uds, f_uds, indent=2, ensure_ascii=False)
+                logger.info(f"Saved {len(uds['pathways'])} new pathways to new_uds.json")
+
+                # 合并新旧路径
+                merged_uds = merge_uds_data(resume_old_uds, uds)
+                uds_file = results_dir / "uds_askcos.json"
+                with open(uds_file, "w") as f_uds:
+                    json.dump(merged_uds, f_uds, indent=2, ensure_ascii=False)
+                logger.info(f"Updated uds_askcos.json with {len(merged_uds['pathways'])} total pathways")
+            else:
+                # 正常模式：直接保存 uds_askcos.json
                 uds_file = results_dir / "uds_askcos.json"
                 with open(uds_file, "w") as f_uds:
                     json.dump(uds, f_uds, indent=2, ensure_ascii=False)
@@ -1075,14 +1045,14 @@ if __name__ == "__main__":
             "search_target=C1=COC(/C=C2/C(=O)C3=C(C/2=O)C=CC=C3)=C1",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=200",
+            "time_limit_s=40",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
             "num_routes_to_plot=50",
             "mcts_config.max_expansion_depth=20",
             "expand_purchasable_target=True",
-            "interactive_mode=True",
+            "resume_search=/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T17:37:38"
         ]
         main(argv=argv)
         

@@ -130,6 +130,8 @@ class MolSetGraph(RetrosynthesisSearchGraph[MolSetNode]):
                     mols=new_mol_set,
                     creation_time=creation_time,
                 )
+                new_node._is_new_node = True  # Mark newly created nodes
+
             assert new_node is not self.root_node, "Root node should not be a child."
             self._graph.add_node(new_node)
             new_nodes.append(new_node)
