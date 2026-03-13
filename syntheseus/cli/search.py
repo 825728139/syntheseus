@@ -521,7 +521,6 @@ def run_from_config(config: SearchConfig) -> Path:
         else:
             resume_old_uds = None
             logger.info("No existing UDS data found, starting with empty UDS")
-        resume_routes_num = len(resume_old_uds.get('pathways', [])) if resume_old_uds else 0
         alg.run_from_graph(output_graph)
 
         # 匹配兼容变量名，准备后续处理
@@ -530,21 +529,17 @@ def run_from_config(config: SearchConfig) -> Path:
         results_lock_path.touch()
         results_stats_path = results_dir / "stats.json"
         all_stats: List[Dict[str, Any]] = []
-        root_node = output_graph._root_node
-        if hasattr(root_node, 'mol'):
-            # AndOrGraph (retro_star)
-            root_smiles = root_node.mol.smiles
-        elif hasattr(root_node, 'mols'):
-            # MolSetGraph (MCTS)
-            root_smiles = list(root_node.mols)[0].smiles if len(root_node.mols) == 1 else None
-            if root_smiles is None:
-                root_smiles = ','.join(sorted([mol.smiles for mol in root_node.mols]))
-        else:
-            root_smiles = None
 
         # 恢复搜索：设置标志变量，供后续共享代码使用
         is_resume_mode = True
 
+    # 初始化根节点信息（供后续统计和 UDS 构建使用）
+    root_node = list(routes[0])[0]
+    if hasattr(root_node, 'mol'):
+        root_molecule = root_node.mol
+    elif hasattr(root_node, 'mols'):
+        root_molecule = list(root_node.mols)[0]
+    
     # Time of first solution (rxn model calls)
     for node in output_graph.nodes():
         node.data["analysis_time"] = node.data["num_calls_rxn_model"]
@@ -559,7 +554,7 @@ def run_from_config(config: SearchConfig) -> Path:
 
     stats = {
         "index": "resume" if is_resume_mode else idx,
-        "smiles": "resume" if is_resume_mode else smiles,
+        "smiles": root_molecule.smiles,
         "target_in_inventory": "resume" if is_resume_mode else target_in_inventory,
         "rxn_model_calls_used": alg.reaction_model.num_calls(),
         "num_nodes_in_final_tree": len(output_graph),
@@ -621,15 +616,6 @@ def run_from_config(config: SearchConfig) -> Path:
             }
             global_smiles_to_uuid = {}  # 全局 SMILES 到 UUID 的映射
             ROOT_UUID = "00000000-0000-0000-0000-000000000000"
-
-            # 获取根节点 SMILES（目标分子）添加到 node_dict
-            root_node = list(routes[0])[0]
-            if hasattr(root_node, 'mol'):
-                root_molecule = root_node.mol
-            elif hasattr(root_node, 'mols'):
-                root_molecule = list(root_node.mols)[0]
-            else:
-                root_molecule = None
         
             uds["node_dict"][root_molecule.smiles] = {
                 "smiles": root_molecule.smiles,
@@ -690,7 +676,7 @@ def run_from_config(config: SearchConfig) -> Path:
                                     }
 
                                     # 生成/复用 UUID
-                                    if chem_smiles == root_smiles:
+                                    if chem_smiles == root_molecule.smiles:
                                         uuid = ROOT_UUID
                                     elif chem_smiles in global_smiles_to_uuid:
                                         uuid = global_smiles_to_uuid[chem_smiles]
