@@ -132,7 +132,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         self,
         model_dir: Union[str, Path],
         device: str,
-        inventory_file: Union[str, Path] = "emolecules.txt",
+        inventory_file: set,
         **kwargs
     ) -> None:
         """Initialize SimpRetro model.
@@ -140,7 +140,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         Args:
             model_dir: Path to template JSON file
             device: Device for neural filter ('cpu' or 'cuda')
-            inventory_file: Path to inventory/building block file (default: emolecules.txt)
+            inventory_file: Path to inventory/building block file, or a pre-loaded set of smiles (default: emolecules.txt)
         """
         super().__init__(model_dir=model_dir, device=device, **kwargs)
 
@@ -169,17 +169,8 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         save_fingerprint_base()
 
         # Load in-stock molecule list
-        inventory_path = Path(inventory_file)
-        if not inventory_path.is_absolute():
-            # If relative path, try current directory first, then model directory
-            if inventory_path.exists():
-                inventory_path = inventory_path.resolve()
-            else:
-                inventory_path = Path(self.model_dir).parent / inventory_file
-        print("手动加载库存文件, simpretro.py, line 122, inventory_path:", inventory_path)
-        inventory_path = Path("/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt")
-        self.instock_list = set(open(inventory_path).read().split("\n"))
-        print(f"Number of in-stock molecules: {len(self.instock_list)}")
+        self.instock_list = inventory_file
+        print(f"Using provided in-stock molecules: {len(self.instock_list)}")
 
         # Load neural network filter
         self.filter = Net_orig()
@@ -241,7 +232,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                         + w2 * asscore
                         + w3 * rdscore          # 返回值0或1
                         + w4 * mdscore     # 计算预测反应物个数的倒数
-                        + 0.1 * (10 if template_raw in self.private_templates else 0)   # 如果模板在私有模板列表中，则增加5分
+                        + 0 * (10 if template_raw in self.private_templates else 0)   # 如果模板在私有模板列表中，则增加5分
                     )
                     # if score > 0:
                     #     print(f"CDScore: {cdscore}, ASScore: {asscore}, RDScore: {rdscore}, MDScore: {mdscore}, Overall Score: {score}")
@@ -287,22 +278,23 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                 templates = [t[1] for t in scores]
                 scores = [s[0] for s in scores]
                 # Convert scores to probabilities using softmax
-                scores = [np.exp(s) for s in scores]
-                total = sum(scores)
+                probability = [np.exp(s) for s in scores]
+                total = sum(probability)
                 if total > 0:
-                    scores = [s / total for s in scores]
+                    probability = [p / total for p in probability]
                 else:
-                    scores = [1.0 / len(scores)] * len(scores)
-                raw_outputs.append((reactants, scores, templates))
+                    probability = [1.0 / len(probability)] * len(probability)
+                raw_outputs.append((reactants, probability, scores, templates))
             else:
-                raw_outputs.append(([], [], []))
+                raw_outputs.append(([], [], [], []))
 
         # Convert to new format using process_raw_smiles_outputs_backwards
         return [
             process_raw_smiles_outputs_backwards(
                 input=input,
                 output_list=output[0],
-                metadata_list=[{"probability": score, "template": temp_smarts} for score, temp_smarts in zip(output[1], output[2])],
+                metadata_list=[{"probability": probability, "score": score, "template": temp_smarts} 
+                               for probability, score, temp_smarts in zip(output[1], output[2], output[3])],
             )
             for input, output in zip(inputs, raw_outputs)
         ]
