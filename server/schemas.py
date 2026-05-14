@@ -35,3 +35,4 @@ class SearchResponse(BaseModel):
     num_routes_found: int
     time_elapsed_s: float
     graph_nodes: int
+    rxn_calls: int = Field(..., description="反应模型调用次数")

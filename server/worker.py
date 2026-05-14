@@ -210,4 +210,5 @@ def run_search(req: SearchRequest) -> dict:
         "num_routes_found": len(routes),
         "time_elapsed_s": round(elapsed, 3),
         "graph_nodes": len(graph),
+        "rxn_calls": alg.reaction_model.num_calls(),
     }

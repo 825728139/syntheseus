@@ -1,9 +1,13 @@
 import asyncio
+import hashlib
 import logging
 import multiprocessing as mp
 import os
+import threading
+import time
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
+from typing import Optional
 
 # 必须在导入任何库之前设置：关闭 OpenMP/MKL 线程池，避免 fork 时子进程死锁。
 # NumPy、PyTorch、RDKit 等库在首次导入时会初始化 OpenMP 线程池，
@@ -61,6 +65,56 @@ class Settings:
 
 
 settings = Settings()
+
+
+# ============================================================================
+# 请求结果缓存（针对重复请求，减少搜索开销）
+# ============================================================================
+
+class ResponseCache:
+    """带 TTL 和容量上限的 LRU 缓存，键为请求参数的 SHA256。"""
+
+    def __init__(self, max_size: int = 100, ttl_seconds: int = 300):
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._store: dict[str, tuple[float, object]] = {}  # key -> (timestamp, value)
+        self._order: list[str] = []  # 访问顺序，最早在末尾
+        self._lock = threading.Lock()
+
+    def _make_key(self, smiles: str, backend: str, options: dict) -> str:
+        raw = f"{smiles}|{backend}|{options}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def get(self, smiles: str, backend: str, options: dict) -> Optional[object]:
+        key = self._make_key(smiles, backend, options)
+        with self._lock:
+            if key not in self._store:
+                return None
+            ts, value = self._store[key]
+            if time.time() - ts > self._ttl:
+                del self._store[key]
+                self._order.remove(key)
+                return None
+            # 命中：移到末尾（最近使用）
+            self._order.remove(key)
+            self._order.append(key)
+            return value
+
+    def put(self, smiles: str, backend: str, options: dict, value: object) -> None:
+        key = self._make_key(smiles, backend, options)
+        with self._lock:
+            if key in self._store:
+                self._order.remove(key)
+            elif len(self._store) >= self._max_size:
+                # 淘汰最久未使用的条目
+                old = self._order.pop(0)
+                del self._store[old]
+            self._store[key] = (time.time(), value)
+            self._order.append(key)
+
+
+# 缓存：最多 100 条，有效期 24 小时（峰值约 2~20MB）
+_cache = ResponseCache(max_size=100, ttl_seconds=86400)
 
 
 # ============================================================================
@@ -136,6 +190,13 @@ async def retrosynthesis_search(req: SearchRequest):
     if not req.smiles.strip():
         raise HTTPException(status_code=400, detail="SMILES is required")
 
+    # 先查缓存
+    options_dict = req.build_tree_options.model_dump()
+    cached = _cache.get(req.smiles, req.backend, options_dict)
+    if cached is not None:
+        logger.info("Cache hit for smiles=%s backend=%s", req.smiles[:12], req.backend)
+        return SearchResponse(**cached)
+
     # Executor 超时略大于请求超时，作为硬兜底
     executor_timeout = req.timeout + 10
 
@@ -149,6 +210,7 @@ async def retrosynthesis_search(req: SearchRequest):
 
     try:
         result_dict = await asyncio.to_thread(_run_with_timeout)
+        _cache.put(req.smiles, req.backend, options_dict, result_dict)
         return SearchResponse(**result_dict)
     except TimeoutError:
         raise HTTPException(

@@ -36,7 +36,7 @@ struct MatchConfig {
 };
 
 // ============================================================================
-// Template Library — pre-parsed templates, constructed once at init time
+// Template Library — pre-parsed templates + inventory, constructed once at init
 // ============================================================================
 
 class TemplateLibrary {
@@ -55,9 +55,19 @@ public:
     rdchiral::Reaction& get(int idx) { return *reactions[idx]; }
     const std::string& raw(int idx) const { return raw_templates[idx]; }
 
+    // Set inventory once — avoids passing 23M strings on every call
+    void set_inventory(const std::unordered_set<std::string>& inv) {
+        in_stock = inv;
+    }
+
+    const std::unordered_set<std::string>& get_inventory() const {
+        return in_stock;
+    }
+
 private:
     std::vector<std::unique_ptr<rdchiral::Reaction>> reactions;
     std::vector<std::string> raw_templates;
+    std::unordered_set<std::string> in_stock;
 };
 
 // ============================================================================
@@ -228,11 +238,11 @@ struct MatchResult {
 
 MatchResult match_single_molecule(
     const std::string& product_smiles,
-    const std::vector<std::string>& templates_raw,  // pass raw templates for indexing
     TemplateLibrary& lib,
-    const std::unordered_set<std::string>& in_stock,
     const MatchConfig& config
 ) {
+    const auto& in_stock = lib.get_inventory();
+
     // Parse product molecule once
     std::unique_ptr<RDKit::ROMol> p_mol(RDKit::SmilesToMol(product_smiles));
     if (!p_mol) {
@@ -318,13 +328,9 @@ struct MatchOutput {
 MatchOutput match_all_templates(
     const std::string& product_smiles,
     TemplateLibrary& lib,
-    const std::vector<std::string>& templates_raw,
-    const std::unordered_set<std::string>& in_stock,
     const MatchConfig& config
 ) {
-    MatchResult cpp_result = match_single_molecule(
-        product_smiles, templates_raw, lib, in_stock, config
-    );
+    MatchResult cpp_result = match_single_molecule(product_smiles, lib, config);
 
     MatchOutput output;
     for (const auto& [key, val] : cpp_result.results) {
@@ -352,7 +358,10 @@ PYBIND11_MODULE(simpretro_match, m) {
         .def(py::init<const std::vector<std::string>&>(),
              py::arg("templates"),
              "Pre-parse all templates into rdchiral Reaction objects (done once at init)")
-        .def("__len__", &TemplateLibrary::size);
+        .def("__len__", &TemplateLibrary::size)
+        .def("set_inventory", &TemplateLibrary::set_inventory,
+             py::arg("in_stock"),
+             "Set inventory once at init — avoids passing 23M strings on every call");
 
     py::class_<MatchConfig>(m, "MatchConfig")
         .def(py::init<>())
@@ -374,8 +383,6 @@ PYBIND11_MODULE(simpretro_match, m) {
     m.def("match_all_templates", &match_all_templates,
         py::arg("product_smiles"),
         py::arg("template_library"),
-        py::arg("templates_raw"),
-        py::arg("in_stock"),
         py::arg("config") = MatchConfig(),
         "Match single product against pre-parsed template library");
 }
