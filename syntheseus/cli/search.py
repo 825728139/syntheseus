@@ -362,18 +362,19 @@ def run_from_config(config: SearchConfig) -> Path:
             "Neither 'save_graph' nor 'num_routes_to_plot' is set; output saved will be minimal"
         )
 
-    # Load the single-step model
+    # Set up the inventory (先加载 inventory，以便传递给模型)
+    mol_inventory = SmilesListInventory.load_from_file(
+        config.inventory_smiles_file, canonicalize=config.canonicalize_inventory
+    )
+
+    # Load the single-step model (传递已加载的 inventory)
     search_rxn_model = get_model(  # type: ignore
         config,
         batch_size=1,
         num_gpus=int(config.use_gpu),
         use_cache=config.reaction_model_use_cache,
         default_num_results=config.num_top_results,
-    )
-
-    # Set up the inventory
-    mol_inventory = SmilesListInventory.load_from_file(
-        config.inventory_smiles_file, canonicalize=config.canonicalize_inventory
+        inventory_file=mol_inventory._smiles_set,
     )
 
     alg = config.search_algorithm.value(
@@ -521,6 +522,8 @@ def run_from_config(config: SearchConfig) -> Path:
         else:
             resume_old_uds = None
             logger.info("No existing UDS data found, starting with empty UDS")
+
+        print("Running resume_search ...")
         alg.run_from_graph(output_graph)
 
         # 匹配兼容变量名，准备后续处理
@@ -534,7 +537,7 @@ def run_from_config(config: SearchConfig) -> Path:
         is_resume_mode = True
 
     # 初始化根节点信息（供后续统计和 UDS 构建使用）
-    root_node = list(routes[0])[0]
+    root_node = output_graph._root_node
     if hasattr(root_node, 'mol'):
         root_molecule = root_node.mol
     elif hasattr(root_node, 'mols'):
@@ -574,7 +577,7 @@ def run_from_config(config: SearchConfig) -> Path:
         # Extract some synthesis routes in the order they were found
         logger.info(f"Extracting up to {config.num_routes_to_plot} routes for analysis")
 
-        # TODO(kmaziarz): Add options to extract a diverse (or otherwise interesting) subset.
+        # TODO(kmaziarz): Add options to extract a diverse (or otherwise interesting) subset.(期待Syntheseus的github项目的后续更新)
         # routes: Iterator = iter_routes_time_order(
         #     output_graph, max_routes=config.num_routes_to_plot
         # )
@@ -631,7 +634,7 @@ def run_from_config(config: SearchConfig) -> Path:
             global_smiles_to_uuid[root_molecule.smiles] = ROOT_UUID
             uds["uuid2smiles"][ROOT_UUID] = root_molecule.smiles
 
-            resume_routes_num = len(resume_old_uds.get('pathways', [])) if resume_old_uds else 0
+            resume_routes_num = len(resume_old_uds.get('pathways', [])) if is_resume_mode else 0
             for route_idx, route in enumerate(routes):
                 route_idx += resume_routes_num  # 如果是恢复模式，继续之前的索引
                 # 初始化当前路径的 SMILES 到 UUID 映射
@@ -640,7 +643,7 @@ def run_from_config(config: SearchConfig) -> Path:
 
                 # 提取路径的边信息并构建 UDS 数据
                 route_edges = []
-                if isinstance(output_graph, MolSetGraph):
+                if isinstance(output_graph, (MolSetGraph, AndOrGraph)):
                     # MolSetGraph: 路径是有序节点序列，按深度提取相邻节点间的边
                     route_list = sorted(list(route), key=lambda x: x.depth)
                     for i in range(len(route_list) - 1):
@@ -653,6 +656,7 @@ def run_from_config(config: SearchConfig) -> Path:
                             reaction = edge_data["reaction"]
                             rxn_smiles = reaction.reaction_smiles
                             probability = reaction.metadata['probability']
+                            score = reaction.metadata['score']
                             template = edge_data['reaction'].metadata['template']
                             product = [*reaction.products]
                             reactants = [*reaction.reactants]
@@ -698,7 +702,7 @@ def run_from_config(config: SearchConfig) -> Path:
                                 uds["node_dict"][rxn_smiles] = {
                                     "smiles": rxn_smiles,
                                     "plausibility": probability,
-                                    "rxn_score_from_model": probability,
+                                    "rxn_score_from_model": score,
                                     "model_metadata": [{
                                         "direction": "retro",
                                         "backend": "template_relevance",
@@ -708,8 +712,8 @@ def run_from_config(config: SearchConfig) -> Path:
                                             "max_cum_prob": 0.999,
                                             "attribute_filter": []
                                         },
-                                        "model_score": node_data['policy_score'],
-                                        "normalized_model_score": node_data['policy_score'],
+                                        "model_score": score,
+                                        "normalized_model_score": score,
                                         "rank": 1,
                                         "reaction_id": None,
                                         "reaction_set": None,
@@ -735,7 +739,7 @@ def run_from_config(config: SearchConfig) -> Path:
                                         "scscore": 0.0
                                     },
                                     "precursor_rank": 1,
-                                    "precursor_score": probability,
+                                    "precursor_score": score,
                                     "reaction_properties": {
                                         "canonical_reaction_smiles": rxn_smiles,
                                         "mapped_smiles": rxn_smiles,
@@ -836,6 +840,7 @@ def run_from_config(config: SearchConfig) -> Path:
                                     'reactants': [r.smiles for r in reactants],
                                     'product': [p.smiles for p in product],
                                     'metadata': {'probability': probability,
+                                                 'score': score,
                                                  'template': template}
                                 }
                             })
@@ -1026,19 +1031,20 @@ if __name__ == "__main__":
         # search_target="NC1=Nc2ccc(F)cc2C2CCCC12"
         # "COc1cccc(OC(=O)/C=C/c2cc(OC)c(OC)c(OC)c2)c1"
         # CNC(=O)COc1cc(Cl)c(Cc2ccc(O)c(C(C)C)c2)c(Cl)c1
+        # "resume_search=/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T17:37:38"
         argv = [
             "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-            "search_target=C1=COC(/C=C2/C(=O)C3=C(C/2=O)C=CC=C3)=C1",
+            "search_target=O=C1C(=Cc2ccco2)C(=O)c2ccccc21",
             "model_class=SimpRetro",
-            "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/SimpRetro_templates copy.json",
-            "time_limit_s=40",
+            "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/SimpRetro_templates.json",
+            "time_limit_s=30",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
             "num_routes_to_plot=50",
             "mcts_config.max_expansion_depth=20",
-            "expand_purchasable_target=True",
-            "resume_search=/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T17:37:38"
+            "expand_purchasable_target=True"
         ]
         main(argv=argv)
         
+#retro_star mcts
