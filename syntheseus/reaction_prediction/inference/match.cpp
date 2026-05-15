@@ -14,6 +14,8 @@
 #include <climits>
 #include <tuple>
 #include <memory>
+#include <fstream>
+#include <iostream>
 
 namespace py = pybind11;
 
@@ -55,9 +57,54 @@ public:
     rdchiral::Reaction& get(int idx) { return *reactions[idx]; }
     const std::string& raw(int idx) const { return raw_templates[idx]; }
 
-    // Set inventory once — avoids passing 23M strings on every call
-    void set_inventory(const std::unordered_set<std::string>& inv) {
-        in_stock = inv;
+    // Load inventory directly from file — bypasses pybind11 transfer overhead
+    void set_inventory_file(const std::string& path) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "Warning: cannot open inventory file: " << path << std::endl;
+            return;
+        }
+        std::string line;
+        while (std::getline(file, line)) {
+            // Trim whitespace
+            size_t start = line.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;
+            size_t end = line.find_last_not_of(" \t\r\n");
+            std::string smi = line.substr(start, end - start + 1);
+            if (!smi.empty()) {
+                in_stock.insert(std::move(smi));
+            }
+        }
+        std::cerr << "Loaded " << in_stock.size() << " inventory molecules from " << path << std::endl;
+    }
+
+    // Load private templates from JSON file — bypasses pybind11 transfer
+    void set_private_templates_file(const std::string& path) {
+        // Simple JSON array parser: skip brackets/quotes/commas, extract strings
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "Warning: cannot open private templates file: " << path << std::endl;
+            return;
+        }
+        std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+        // Parse JSON array of strings
+        size_t pos = 0;
+        while ((pos = content.find('"', pos)) != std::string::npos) {
+            size_t end = content.find('"', pos + 1);
+            if (end == std::string::npos) break;
+            std::string tpl = content.substr(pos + 1, end - pos - 1);
+            // Skip empty strings and non-template entries (like bare "[" tokens)
+            if (!tpl.empty() && tpl.find('[') != std::string::npos) {
+                private_templates.insert(std::move(tpl));
+            }
+            pos = end + 1;
+        }
+        std::cerr << "Loaded " << private_templates.size() << " private templates from " << path << std::endl;
+    }
+
+    bool is_private(const std::string& tpl) const {
+        return private_templates.count(tpl) > 0;
     }
 
     const std::unordered_set<std::string>& get_inventory() const {
@@ -68,6 +115,7 @@ private:
     std::vector<std::unique_ptr<rdchiral::Reaction>> reactions;
     std::vector<std::string> raw_templates;
     std::unordered_set<std::string> in_stock;
+    std::unordered_set<std::string> private_templates;
 };
 
 // ============================================================================
@@ -263,7 +311,7 @@ MatchResult match_single_molecule(
         if (n_mapped == 0) continue;
 
         float mdscore = 1.0f / n_mapped;
-        bool template_is_private = config.is_private(lib.raw(idx));
+        bool template_is_private = lib.is_private(lib.raw(idx));
 
         for (int j = 0; j < n_mapped; j++) {
             const std::string& r = products[j];
@@ -359,9 +407,12 @@ PYBIND11_MODULE(simpretro_match, m) {
              py::arg("templates"),
              "Pre-parse all templates into rdchiral Reaction objects (done once at init)")
         .def("__len__", &TemplateLibrary::size)
-        .def("set_inventory", &TemplateLibrary::set_inventory,
-             py::arg("in_stock"),
-             "Set inventory once at init — avoids passing 23M strings on every call");
+        .def("set_inventory_file", &TemplateLibrary::set_inventory_file,
+             py::arg("path"),
+             "Load inventory directly from file — bypasses pybind11 transfer")
+        .def("set_private_templates_file", &TemplateLibrary::set_private_templates_file,
+             py::arg("path"),
+             "Load private templates from JSON file — bypasses pybind11 transfer");
 
     py::class_<MatchConfig>(m, "MatchConfig")
         .def(py::init<>())
@@ -370,10 +421,7 @@ PYBIND11_MODULE(simpretro_match, m) {
         .def_readwrite("w_rd", &MatchConfig::w_rd)
         .def_readwrite("w_md", &MatchConfig::w_md)
         .def_readwrite("w_private", &MatchConfig::w_private)
-        .def_readwrite("private_bonus", &MatchConfig::private_bonus)
-        .def("set_private_templates", [](MatchConfig& self, const std::unordered_set<std::string>& s) {
-            self.private_templates = s;
-        });
+        .def_readwrite("private_bonus", &MatchConfig::private_bonus);
 
     py::class_<MatchOutput>(m, "MatchOutput")
         .def(py::init<>())

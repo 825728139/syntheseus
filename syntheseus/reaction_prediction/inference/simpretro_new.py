@@ -83,7 +83,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         self,
         model_dir: Union[str, Path],
         device: str,
-        inventory_file: set,
+        inventory_file: Union[str, Path, set] = "/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
         **kwargs
     ) -> None:
         """Initialize SimpRetro model.
@@ -91,7 +91,8 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         Args:
             model_dir: Path to template JSON file
             device: Device for neural filter ('cpu' or 'cuda')
-            inventory_file: Path to inventory/building block file, or a pre-loaded set of smiles (default: emolecules.txt)
+            inventory_file: Path to inventory file, or a pre-loaded set of SMILES.
+                If a set is passed, it is written to a temp file for C++ loading.
         """
         super().__init__(model_dir=model_dir, device=device, **kwargs)
 
@@ -102,8 +103,25 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         # C++ TemplateLibrary (pre-parsed, fast matching)
         print("Building C++ TemplateLibrary ...")
         self.cpp_template_lib = TemplateLibrary(self.templates_raw)
-        self.cpp_template_lib.set_inventory(self.instock_list)
-        self.private_templates = json.load(open(Path("/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/cli/private_templates.json")))
+
+        # Handle inventory: file path (C++ reads directly) or set (write to temp for C++)
+        if isinstance(inventory_file, set):
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", prefix="simpretro_inv_", delete=False
+            )
+            for smi in inventory_file:
+                tmp.write(smi + "\n")
+            tmp.close()
+            self.cpp_template_lib.set_inventory_file(tmp.name)
+            print(f"Wrote {len(inventory_file)} inventory SMILES to temp file: {tmp.name}")
+        else:
+            self.cpp_template_lib.set_inventory_file(str(inventory_file))
+
+        # C++ reads private templates directly from JSON file
+        self.cpp_template_lib.set_private_templates_file(
+            str(Path("/home/liwenlong/chemTools/retro_syn/syntheseus/syntheseus/cli/private_templates.json"))
+        )
 
         # Build MatchConfig — heuristic scoring weights
         self.match_config = MatchConfig()
@@ -112,8 +130,6 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         self.match_config.w_rd = 0.5       # RDScore: 环形差异得分，返回值0或1（产物比反应物多环则+1）
         self.match_config.w_md = 0.0       # MDScore: 多样性得分，预测反应物个数的倒数
         self.match_config.w_private = 0.0  # private_bonus: 私有模板加成权重（private_bonus=10.0）
-        if self.private_templates:
-            self.match_config.set_private_templates(set(self.private_templates))
 
         # Use shared fingerprint_base from fast_filter module
         self.fingerprint_base = filter_fingerprint_base
@@ -128,10 +144,6 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         self.template_fps = np.array(self.template_fps)
         # Save updated fingerprints
         save_fingerprint_base()
-
-        # Load in-stock molecule list
-        self.instock_list = inventory_file
-        print(f"Using provided in-stock molecules: {len(self.instock_list)}")
 
         # Load neural network filter
         self.filter = Net_orig()
