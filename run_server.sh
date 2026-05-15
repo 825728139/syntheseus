@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 PORT="${PORT:-8006}"
 CONDA_ENV="${CONDA_ENV:-syntheseus-full-mic}"
 
-export MAX_WORKERS=5
+export MAX_WORKERS=1
 export USE_GPU=false
 
 # 关闭 OpenMP/MKL 线程池，避免 fork 后子进程死锁

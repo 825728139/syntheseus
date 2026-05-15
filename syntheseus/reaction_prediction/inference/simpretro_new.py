@@ -4,10 +4,14 @@ Template-based retrosynthesis model with neural network filtering.
 Combines template matching with heuristics and a fast neural filter.
 """
 
+# Must be set BEFORE importing PyTorch / numpy to prevent fork+OpenMP deadlock.
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import importlib.resources
 import json
 import multiprocessing as mp
-import os
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
@@ -34,26 +38,73 @@ from syntheseus.reaction_prediction.inference.simpretro_match import (
 
 
 # ---------------------------------------------------------------------------
-# Sub-process worker: runs template matching for a single molecule.
-# Lives in the forked child; _MATCH_MODEL is set by initializer.
+# Sub-process worker: runs the full pipeline for a single molecule.
+# Fork COW: children inherit _MATCH_MODEL set by __init__ (no pickling needed).
 # ---------------------------------------------------------------------------
 _MATCH_MODEL: Optional["SimpRetroModel"] = None
 
 
-def _init_match_worker(model: "SimpRetroModel") -> None:
-    global _MATCH_MODEL
-    _MATCH_MODEL = model
-
-
-def _match_single_molecule(smiles: str):
-    """Match one molecule — called inside forked subprocess."""
+def _match_single_molecule(smiles: str, num_results: int, threshold: float = 0.2):
+    """Full pipeline inside forked subprocess: matching + neural filter + sort + probability."""
+    # Phase 1: C++ template matching
     out = match_all_templates(
         product_smiles=smiles,
         template_library=_MATCH_MODEL.cpp_template_lib,
         config=_MATCH_MODEL.match_config,
     )
-    # Convert C++ MatchOutput → plain Python types for IPC
-    return (dict(out.results), list(out.valid_template_ids))
+    # Reproduce old version data structures:
+    # results = {canonical_r: (score, template_raw, idx, rdscore)}
+    # valid_template_id = [idx, ...]
+    results = dict(out.results)
+    valid_template_id = list(out.valid_template_ids)
+
+    # --- Neural network filtering: copied verbatim from simpretro_old.py:244-267 ---
+    valid_temp_fps = _MATCH_MODEL.template_fps[valid_template_id]
+    p_fp = smiles_to_fingerprint(smiles)
+    try:
+        data = torch.tensor(
+            np.concatenate(
+                [valid_temp_fps.squeeze(), np.repeat(p_fp, len(valid_temp_fps), axis=0)],
+                axis=1,
+            ),
+            dtype=torch.float32,
+        )
+        with torch.no_grad():
+            pred = _MATCH_MODEL.filter(data).squeeze().cpu().numpy()
+        validated_results = {}
+        for i, (k, v) in enumerate(results.items()):
+            if pred[valid_template_id.index(v[2])] > threshold or v[-1]:
+                validated_results[k] = (
+                    v[0],
+                    v[1],
+                    v[2],
+                    pred[valid_template_id.index(v[2])],
+                )
+    except Exception as e:
+        print(f"Error in neural filter: {e}")
+        validated_results = {}
+
+    # --- Sort and select top results: copied verbatim from simpretro_old.py:270-289 ---
+    results = sorted(
+        validated_results.items(),
+        key=lambda item: item[1][0] + 0.001 * item[1][-1],
+        reverse=True,
+    )[:num_results]
+
+    if len(results) > 0:
+        reactants, scores = zip(*results)
+        templates = [t[1] for t in scores]
+        scores = [s[0] for s in scores]
+        # Convert scores to probabilities using softmax
+        probability = [np.exp(s) for s in scores]
+        total = sum(probability)
+        if total > 0:
+            probability = [p / total for p in probability]
+        else:
+            probability = [1.0 / len(probability)] * len(probability)
+        return (reactants, probability, scores, templates)
+    else:
+        return ([], [], [], [])
 
 
 def smiles_to_fingerprint(smiles, fp_length=2048, radius=2):
@@ -155,13 +206,14 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                 torch.load(str(model_path), map_location=self.device)
             )
 
-        # Create forked sub-process pool for parallel template matching.
-        # Children inherit TemplateLibrary via copy-on-write (no extra load time).
-        self._match_pool = None
-        self._use_sub_pool = os.getenv("SIMPRETRO_USE_SUB_POOL", "false").lower() in ("true", "1", "yes")
+        # Pool is created lazily in _get_reactions, not here.
+        # This avoids issues with fork inheritance and nested ProcessPoolExecutor
+        # (e.g. when this model runs inside server.py's worker processes).
         self._num_sub_workers = int(os.getenv("SIMPRETRO_NUM_SUB_WORKERS", "4"))
+        self._match_pool = None
+        self._match_pool_pid = None  # track which process owns the pool
 
-        # Set _MATCH_MODEL for sequential path; fork initializer overwrites in children.
+        # Set global for standalone usage (not inside server worker)
         global _MATCH_MODEL
         _MATCH_MODEL = self
 
@@ -169,88 +221,68 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         """Return model parameters for optimization."""
         return self.filter.parameters()
 
+    def close(self):
+        """Close subprocess pool. Call explicitly to avoid interpreter shutdown issues."""
+        if hasattr(self, '_match_pool') and self._match_pool is not None:
+            try:
+                self._match_pool.close()
+                self._match_pool.join()
+            except Exception:
+                pass
+            self._match_pool = None
+
     def _get_reactions(
         self, inputs: List[Molecule], num_results: int
     ) -> List[Sequence[SingleProductReaction]]:
-        """Generate reaction predictions for input molecules."""
-        raw_outputs = []
-        threshold = 0.2
-        n = len(inputs)
+        """Generate reaction predictions for input molecules.
 
-        # Template matching — use forked sub-process pool if available
-        if self._use_sub_pool and n > 1:
-            if self._match_pool is None:
-                self._match_pool = mp.get_context("fork").Pool(
-                    self._num_sub_workers,
-                    initializer=_init_match_worker,
-                    initargs=(self,),
-                )
+        Single molecule: run locally (no fork overhead).
+        Multiple molecules + main process: use forked subprocess pool.
+        Worker process (inside server's ProcessPoolExecutor): always local.
+        """
+        from functools import partial
+
+        n = len(inputs)
+        use_pool = (n > 1 and
+                    mp.current_process().name == "MainProcess" and
+                    self._num_sub_workers > 0)
+
+        # Lazy pool creation + PID-based reinitialization after fork
+        if use_pool:
+            current_pid = os.getpid()
+            if (self._match_pool is None or
+                    self._match_pool_pid != current_pid):
+                # Close stale pool from parent process
+                if self._match_pool is not None:
+                    try:
+                        self._match_pool.close()
+                        self._match_pool.join()
+                    except Exception:
+                        pass
+                # Create new pool in this process
+                self._match_pool = mp.get_context("fork").Pool(self._num_sub_workers)
+                self._match_pool_pid = current_pid
+
+        if use_pool:
             match_data = self._match_pool.map(
-                _match_single_molecule, [x.smiles for x in inputs]
+                partial(_match_single_molecule, num_results=num_results),
+                [x.smiles for x in inputs],
             )
         else:
+            # Single molecule or worker process: run locally
             match_data = [
-                _match_single_molecule(x.smiles) for x in inputs
+                _match_single_molecule(x.smiles, num_results=num_results)
+                for x in inputs
             ]
 
-        for i, x in enumerate(inputs):
-            results, valid_template_id = match_data[i]
-
-            # Neural network filtering phase
-            valid_temp_fps = self.template_fps[valid_template_id]
-            p_fp = smiles_to_fingerprint(x.smiles)
-            try:
-                data = torch.tensor(
-                    np.concatenate(
-                        [valid_temp_fps.squeeze(), np.repeat(p_fp, len(valid_temp_fps), axis=0)],
-                        axis=1,
-                    ),
-                    dtype=torch.float32,
-                )
-                with torch.no_grad():
-                    pred = self.filter(data).squeeze().cpu().numpy()
-                validated_results = {}
-                for k, v in results.items():
-                    if pred[valid_template_id.index(v[2])] > threshold or v[-1]:
-                        validated_results[k] = (
-                            v[0],
-                            v[1],
-                            v[2],
-                            pred[valid_template_id.index(v[2])],
-                        )
-            except Exception as e:
-                print(f"Error in neural filter: {e}")
-                validated_results = {}
-
-            # Sort and select top results
-            sorted_results = sorted(
-                validated_results.items(),
-                key=lambda item: item[1][0] + 0.001 * item[1][-1],
-                reverse=True,
-            )[:num_results]
-
-            if len(sorted_results) > 0:
-                reactants, scores = zip(*sorted_results)
-                templates = [t[1] for t in scores]
-                scores = [s[0] for s in scores]
-                probability = [np.exp(s) for s in scores]
-                total = sum(probability)
-                if total > 0:
-                    probability = [p / total for p in probability]
-                else:
-                    probability = [1.0 / len(probability)] * len(probability)
-                raw_outputs.append((reactants, probability, scores, templates))
-            else:
-                raw_outputs.append(([], [], [], []))
-
-        # Convert to new format using process_raw_smiles_outputs_backwards
+        # Main process: only data conversion, no heavy computation
         return [
             process_raw_smiles_outputs_backwards(
                 input=input,
-                output_list=output[0],
-                metadata_list=[{"probability": probability, "score": score, "template": temp_smarts}
-                               for probability, score, temp_smarts in zip(output[1], output[2], output[3])],
+                output_list=list(output[0]),
+                metadata_list=[{"probability": p, "score": s, "template": t}
+                               for p, s, t in zip(output[1], output[2], output[3])],
             )
-            for input, output in zip(inputs, raw_outputs)
+            for input, output in zip(inputs, match_data)
         ]
         # 虽然这里使用的变量名叫pred、probability，但其输出与其叫反应发生成功率，不如叫模板价值，神经网络应为排除低价值模板产生的合成路径

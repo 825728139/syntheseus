@@ -1034,7 +1034,7 @@ if __name__ == "__main__":
         # "resume_search=/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T17:37:38"
         argv = [
             "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-            "search_target=O=C1C(=Cc2ccco2)C(=O)c2ccccc21",
+            "search_target=CC(=O)Oc1ccccc1C(=O)O",
             "model_class=SimpRetro",
             "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/SimpRetro_templates.json",
             "time_limit_s=30",

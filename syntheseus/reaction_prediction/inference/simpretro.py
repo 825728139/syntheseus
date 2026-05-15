@@ -5,6 +5,7 @@ Combines template matching with heuristics and a fast neural filter.
 """
 
 # Must be set BEFORE importing PyTorch / numpy to prevent fork+OpenMP deadlock.
+import atexit
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -223,7 +224,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
 
     def close(self):
         """Close subprocess pool. Call explicitly to avoid interpreter shutdown issues."""
-        if hasattr(self, '_match_pool') and self._match_pool is not None:
+        if self._match_pool is not None:
             try:
                 self._match_pool.close()
                 self._match_pool.join()
@@ -261,6 +262,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                         pass
                 # Create new pool in this process
                 self._match_pool = mp.get_context("fork").Pool(self._num_sub_workers)
+                _ALL_POOLS.append(self._match_pool)
                 self._match_pool_pid = current_pid
 
         if use_pool:
@@ -286,3 +288,19 @@ class SimpRetroModel(ExternalBackwardReactionModel):
             for input, output in zip(inputs, match_data)
         ]
         # 虽然这里使用的变量名叫pred、probability，但其输出与其叫反应发生成功率，不如叫模板价值，神经网络应为排除低价值模板产生的合成路径
+
+
+# Global registry for atexit cleanup — prevents Pool.__del__ errors on interpreter shutdown.
+_ALL_POOLS: List = []
+
+
+def _cleanup_all_pools():
+    for pool in list(_ALL_POOLS):
+        try:
+            pool.close()
+            pool.join()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_all_pools)
