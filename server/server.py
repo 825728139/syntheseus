@@ -238,10 +238,32 @@ async def lifespan(_app: FastAPI):
     logger.info("Process pool shut down")
 
 
+tags_metadata = [
+    {
+        "name": "搜索",
+        "description": "逆合成搜索接口，支持阻塞式和异步轮询两种模式。",
+    },
+    {
+        "name": "任务",
+        "description": "异步任务状态查询。",
+    },
+    {
+        "name": "系统",
+        "description": "健康检查等运维接口。",
+    },
+]
+
 app = FastAPI(
     title="Retro Synthesis Search API",
-    description="逆合成规划搜索服务，预热加载模型和库存",
+    description=(
+        "逆合成规划搜索服务。支持 MCTS、Retro*、PDVN 三种搜索算法。\n\n"
+        "**使用流程**：\n"
+        "1. `POST /api/retrosynthesis/search` 阻塞式搜索（短任务推荐）\n"
+        "2. `POST /api/retrosynthesis/search/async` + `GET /api/retrosynthesis/status/{task_id}` 异步轮询（长任务推荐）\n"
+        "3. 设置 `save_graph=true` 可缓存搜索图，通过返回的 `graph_id` 传入 `resume_from` 进行续算"
+    ),
     version="1.0.0",
+    openapi_tags=tags_metadata,
     lifespan=lifespan,
 )
 
@@ -286,7 +308,18 @@ async def _run_search_task(task_id: str, req: SearchRequest, cache_key_options: 
         _task_store.set_failed(task_id, f"Search failed: {e}")
 
 
-@app.post("/api/retrosynthesis/search", response_model=SearchResponse)
+@app.post(
+    "/api/retrosynthesis/search",
+    response_model=SearchResponse,
+    tags=["搜索"],
+    summary="阻塞式逆合成搜索",
+    description="提交目标分子，等待搜索完成后返回合成路线。适合 expension_time < 60s 的短任务。",
+    responses={
+        400: {"description": "SMILES 为空或参数错误"},
+        500: {"description": "搜索执行异常"},
+        504: {"description": "搜索超时"},
+    },
+)
 async def retrosynthesis_search(req: SearchRequest):
     """阻塞式搜索：等待结果完成后返回。"""
     if not req.smiles.strip():
@@ -328,7 +361,16 @@ async def retrosynthesis_search(req: SearchRequest):
         raise HTTPException(status_code=500, detail=f"Search failed: {e}")
 
 
-@app.post("/api/retrosynthesis/search/async", response_model=TaskSubmitResponse)
+@app.post(
+    "/api/retrosynthesis/search/async",
+    response_model=TaskSubmitResponse,
+    tags=["搜索"],
+    summary="异步逆合成搜索",
+    description="提交目标分子，立即返回 task_id，通过 `GET /api/retrosynthesis/status/{task_id}` 轮询结果。适合长任务。",
+    responses={
+        400: {"description": "SMILES 为空或参数错误"},
+    },
+)
 async def retrosynthesis_search_async(req: SearchRequest):
     """异步搜索：立即返回 task_id，通过轮询获取结果。"""
     if not req.smiles.strip():
@@ -351,7 +393,16 @@ async def retrosynthesis_search_async(req: SearchRequest):
     return TaskSubmitResponse(task_id=task_id, status="pending")
 
 
-@app.get("/api/retrosynthesis/status/{task_id}", response_model=TaskStatusResponse)
+@app.get(
+    "/api/retrosynthesis/status/{task_id}",
+    response_model=TaskStatusResponse,
+    tags=["任务"],
+    summary="查询异步任务状态",
+    description="轮询异步搜索任务的状态。status 为 completed 时 result 包含搜索结果，failed 时 error 包含错误信息。",
+    responses={
+        404: {"description": "任务不存在或已过期（1h TTL）"},
+    },
+)
 async def task_status(task_id: str):
     """查询异步任务状态。"""
     task = _task_store.get(task_id)
@@ -370,7 +421,7 @@ async def task_status(task_id: str):
     )
 
 
-@app.get("/health")
+@app.get("/health", tags=["系统"], summary="健康检查")
 async def health():
     return {"status": "ok"}
 
