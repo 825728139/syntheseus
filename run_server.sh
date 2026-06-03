@@ -19,4 +19,4 @@ export VECLIB_MAXIMUM_THREADS=1
 
 echo "Starting Retro Synthesis Search API on port $PORT ..."
 echo "Using conda env: $CONDA_ENV"
-conda run -n "$CONDA_ENV" --no-capture-output uvicorn server.server:app --host 0.0.0.0 --port "$PORT"
+conda run -n "$CONDA_ENV" --no-capture-output uvicorn server.server:app --host 0.0.0.0 --port "$PORT" --timeout-keep-alive 1800
