@@ -6,7 +6,9 @@ then executes search requests independently."""
 
 import logging
 import os
+import pickle
 import time
+from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
@@ -166,8 +168,22 @@ def run_search(req: SearchRequest) -> dict:
     else:
         raise ValueError(f"Unsupported backend: {backend!r}. Supported: mcts, retro_star, pdvn")
 
-    alg.reset()
-    graph, _ = alg.run_from_mol(target)
+    graph_dir = os.getenv("GRAPH_DIR", "./search_graphs")
+
+    if bto.resume_from:
+        # 续算模式：从缓存的 graph.pkl 加载，继续搜索
+        graph_path = Path(graph_dir) / f"{bto.resume_from}.pkl"
+        if not graph_path.exists():
+            raise ValueError(f"Graph file not found: {graph_path}")
+        with open(graph_path, "rb") as f:
+            graph = pickle.load(f)
+        logger.info("Worker: loaded graph from %s (%d nodes)", graph_path, len(graph))
+        alg.run_from_graph(graph)
+    else:
+        # 全新搜索
+        alg.reset()
+        graph, _ = alg.run_from_mol(target)
+
     elapsed = time.time() - start
 
     # 用 tqdm 打印搜索耗时摘要
@@ -204,7 +220,7 @@ def run_search(req: SearchRequest) -> dict:
                 "total_score": total_score,
             })
 
-    return {
+    result = {
         "target_smiles": target.smiles,
         "routes": routes,
         "num_routes_found": len(routes),
@@ -212,3 +228,8 @@ def run_search(req: SearchRequest) -> dict:
         "graph_nodes": len(graph),
         "rxn_calls": alg.reaction_model.num_calls(),
     }
+
+    if bto.save_graph:
+        result["graph"] = graph
+
+    return result

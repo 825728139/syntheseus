@@ -3,10 +3,13 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import pickle
 import threading
 import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 # 必须在导入任何库之前设置：关闭 OpenMP/MKL 线程池，避免 fork 时子进程死锁。
@@ -22,11 +25,11 @@ from fastapi import FastAPI, HTTPException
 
 try:
     # 被 uvicorn 从父目录导入时
-    from server.schemas import SearchRequest, SearchResponse
+    from server.schemas import SearchRequest, SearchResponse, TaskSubmitResponse, TaskStatusResponse
     from server.worker import init_worker, run_search
 except ImportError:
     # 直接运行 server.py 时
-    from schemas import SearchRequest, SearchResponse
+    from schemas import SearchRequest, SearchResponse, TaskSubmitResponse, TaskStatusResponse
     from worker import init_worker, run_search
 
 logging.basicConfig(
@@ -63,8 +66,14 @@ class Settings:
     # Process pool settings
     MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "2"))
 
+    # Graph storage
+    GRAPH_DIR: str = os.getenv("GRAPH_DIR", "./search_graphs")
+
 
 settings = Settings()
+
+# 创建 graph 存储目录
+Path(settings.GRAPH_DIR).mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
@@ -72,12 +81,11 @@ settings = Settings()
 # ============================================================================
 
 class ResponseCache:
-    """带 TTL 和容量上限的 LRU 缓存，键为请求参数的 SHA256。"""
+    """LRU 缓存，键为请求参数的 SHA256，仅由容量上限控制淘汰。"""
 
-    def __init__(self, max_size: int = 100, ttl_seconds: int = 300):
+    def __init__(self, max_size: int = 100):
         self._max_size = max_size
-        self._ttl = ttl_seconds
-        self._store: dict[str, tuple[float, object]] = {}  # key -> (timestamp, value)
+        self._store: dict[str, object] = {}
         self._order: list[str] = []  # 访问顺序，最早在末尾
         self._lock = threading.Lock()
 
@@ -90,15 +98,10 @@ class ResponseCache:
         with self._lock:
             if key not in self._store:
                 return None
-            ts, value = self._store[key]
-            if time.time() - ts > self._ttl:
-                del self._store[key]
-                self._order.remove(key)
-                return None
             # 命中：移到末尾（最近使用）
             self._order.remove(key)
             self._order.append(key)
-            return value
+            return self._store[key]
 
     def put(self, smiles: str, backend: str, options: dict, value: object) -> None:
         key = self._make_key(smiles, backend, options)
@@ -106,15 +109,73 @@ class ResponseCache:
             if key in self._store:
                 self._order.remove(key)
             elif len(self._store) >= self._max_size:
-                # 淘汰最久未使用的条目
                 old = self._order.pop(0)
                 del self._store[old]
-            self._store[key] = (time.time(), value)
+            self._store[key] = value
             self._order.append(key)
 
 
-# 缓存：最多 100 条，有效期 24 小时（峰值约 2~20MB）
-_cache = ResponseCache(max_size=100, ttl_seconds=86400)
+# 缓存：最多 100 条，永不过期（峰值约 2~20MB）
+_cache = ResponseCache(max_size=100)
+
+
+# ============================================================================
+# 异步任务存储
+# ============================================================================
+
+class TaskStore:
+    """线程安全的异步任务存储，支持过期清理。"""
+
+    def __init__(self, ttl_seconds: int = 3600):
+        self._ttl = ttl_seconds
+        self._tasks: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def create(self) -> str:
+        task_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._tasks[task_id] = {
+                "status": "pending",
+                "result": None,
+                "error": None,
+                "created_at": time.time(),
+            }
+        return task_id
+
+    def set_running(self, task_id: str) -> None:
+        with self._lock:
+            if task_id in self._tasks:
+                self._tasks[task_id]["status"] = "running"
+
+    def set_completed(self, task_id: str, result: dict) -> None:
+        with self._lock:
+            if task_id in self._tasks:
+                self._tasks[task_id]["status"] = "completed"
+                self._tasks[task_id]["result"] = result
+
+    def set_failed(self, task_id: str, error: str) -> None:
+        with self._lock:
+            if task_id in self._tasks:
+                self._tasks[task_id]["status"] = "failed"
+                self._tasks[task_id]["error"] = error
+
+    def get(self, task_id: str) -> Optional[dict]:
+        with self._lock:
+            self._cleanup_expired()
+            return self._tasks.get(task_id)
+
+    def _cleanup_expired(self) -> None:
+        now = time.time()
+        expired = [tid for tid, t in self._tasks.items() if now - t["created_at"] > self._ttl]
+        for tid in expired:
+            # 清理关联的 graph 文件
+            graph_path = Path(settings.GRAPH_DIR) / f"{tid}.pkl"
+            if graph_path.exists():
+                graph_path.unlink()
+            del self._tasks[tid]
+
+
+_task_store = TaskStore(ttl_seconds=3600)
 
 
 # ============================================================================
@@ -185,20 +246,22 @@ app = FastAPI(
 )
 
 
-@app.post("/api/retrosynthesis/search", response_model=SearchResponse)
-async def retrosynthesis_search(req: SearchRequest):
-    if not req.smiles.strip():
-        raise HTTPException(status_code=400, detail="SMILES is required")
+def _process_graph_result(result_dict: dict, task_id: str) -> dict:
+    """保存 graph 并设置 graph_id，从结果中移除 graph 对象。"""
+    graph_obj = result_dict.pop("graph", None)
+    if graph_obj is not None:
+        graph_path = Path(settings.GRAPH_DIR) / f"{task_id}.pkl"
+        with open(graph_path, "wb") as f:
+            pickle.dump(graph_obj, f)
+        logger.info("Saved graph to %s", graph_path)
+        result_dict["graph_id"] = task_id
+    return result_dict
 
-    # 先查缓存
-    options_dict = req.build_tree_options.model_dump()
-    cached = _cache.get(req.smiles, req.backend, options_dict)
-    if cached is not None:
-        logger.info("Cache hit for smiles=%s backend=%s", req.smiles[:12], req.backend)
-        return SearchResponse(**cached)
 
-    # Executor 超时略大于请求超时，作为硬兜底
-    executor_timeout = req.timeout + 10
+async def _run_search_task(task_id: str, req: SearchRequest, cache_key_options: dict):
+    """后台执行搜索任务。"""
+    _task_store.set_running(task_id)
+    executor_timeout = req.build_tree_options.expansion_time + 60
 
     def _run_with_timeout() -> dict:
         future = _pool.submit(run_search, req)
@@ -210,18 +273,101 @@ async def retrosynthesis_search(req: SearchRequest):
 
     try:
         result_dict = await asyncio.to_thread(_run_with_timeout)
+        result_dict = _process_graph_result(result_dict, task_id)
+        _cache.put(req.smiles, req.backend, cache_key_options, result_dict)
+        _task_store.set_completed(task_id, result_dict)
+        logger.info("Task %s completed", task_id)
+    except TimeoutError:
+        _task_store.set_failed(task_id, f"Search timed out after {req.build_tree_options.expansion_time}s")
+    except ValueError as e:
+        _task_store.set_failed(task_id, str(e))
+    except Exception as e:
+        logger.exception("Task %s failed", task_id)
+        _task_store.set_failed(task_id, f"Search failed: {e}")
+
+
+@app.post("/api/retrosynthesis/search", response_model=SearchResponse)
+async def retrosynthesis_search(req: SearchRequest):
+    """阻塞式搜索：等待结果完成后返回。"""
+    if not req.smiles.strip():
+        raise HTTPException(status_code=400, detail="SMILES is required")
+
+    # 先查缓存
+    options_dict = req.build_tree_options.model_dump()
+    cached = _cache.get(req.smiles, req.backend, options_dict)
+    if cached is not None:
+        logger.info("Cache hit for smiles=%s backend=%s", req.smiles[:12], req.backend)
+        return SearchResponse(**cached)
+
+    # Executor 超时 = 搜索时间上限 + 60s 兜底
+    executor_timeout = req.build_tree_options.expansion_time + 60
+
+    def _run_with_timeout() -> dict:
+        future = _pool.submit(run_search, req)
+        try:
+            return future.result(timeout=executor_timeout)
+        except Exception:
+            future.cancel()
+            raise
+
+    try:
+        result_dict = await asyncio.to_thread(_run_with_timeout)
+        graph_id = uuid.uuid4().hex[:12]
+        result_dict = _process_graph_result(result_dict, graph_id)
         _cache.put(req.smiles, req.backend, options_dict, result_dict)
         return SearchResponse(**result_dict)
     except TimeoutError:
         raise HTTPException(
             status_code=504,
-            detail=f"Search timed out after {req.timeout}s",
+            detail=f"Search timed out after {req.build_tree_options.expansion_time}s",
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Search failed")
         raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+
+
+@app.post("/api/retrosynthesis/search/async", response_model=TaskSubmitResponse)
+async def retrosynthesis_search_async(req: SearchRequest):
+    """异步搜索：立即返回 task_id，通过轮询获取结果。"""
+    if not req.smiles.strip():
+        raise HTTPException(status_code=400, detail="SMILES is required")
+
+    # 先查缓存
+    options_dict = req.build_tree_options.model_dump()
+    cached = _cache.get(req.smiles, req.backend, options_dict)
+    if cached is not None:
+        logger.info("Cache hit for smiles=%s backend=%s", req.smiles[:12], req.backend)
+        task_id = _task_store.create()
+        _task_store.set_completed(task_id, cached)
+        return TaskSubmitResponse(task_id=task_id, status="completed")
+
+    # 创建异步任务
+    task_id = _task_store.create()
+    logger.info("Task %s created for smiles=%s backend=%s", task_id, req.smiles[:12], req.backend)
+
+    asyncio.create_task(_run_search_task(task_id, req, options_dict))
+    return TaskSubmitResponse(task_id=task_id, status="pending")
+
+
+@app.get("/api/retrosynthesis/status/{task_id}", response_model=TaskStatusResponse)
+async def task_status(task_id: str):
+    """查询异步任务状态。"""
+    task = _task_store.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found or expired")
+
+    result = None
+    if task["result"] is not None:
+        result = SearchResponse(**task["result"])
+
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=task["status"],
+        result=result,
+        error=task["error"],
+    )
 
 
 @app.get("/health")

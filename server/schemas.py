@@ -9,13 +9,14 @@ class BuildTreeOptions(BaseModel):
     max_iterations: int = Field(default=0, description="0 = 不限制迭代次数")
     expand_purchasable_target: bool = Field(default=True, description="即使目标分子在库存中也展开搜索")
     stop_on_first_solution: bool = Field(default=False, description="找到第一个解即停止")
+    save_graph: bool = Field(default=False, description="是否缓存搜索图（用于续算）")
+    resume_from: Optional[str] = Field(default=None, description="从指定 task_id 的搜索图续算")
 
 
 class SearchRequest(BaseModel):
     smiles: str = Field(..., description="目标分子 SMILES")
     backend: str = Field(default="mcts", description="搜索算法：mcts / retro_star / pdvn")
     build_tree_options: BuildTreeOptions = Field(default_factory=BuildTreeOptions)
-    timeout: int = Field(default=300, description="请求超时（秒）")
 
 
 class ReactionStep(BaseModel):
@@ -36,3 +37,16 @@ class SearchResponse(BaseModel):
     time_elapsed_s: float
     graph_nodes: int
     rxn_calls: int = Field(..., description="反应模型调用次数")
+    graph_id: Optional[str] = Field(default=None, description="缓存的搜索图 ID（用于续算）")
+
+
+class TaskSubmitResponse(BaseModel):
+    task_id: str
+    status: str = Field(description="任务状态: pending / running / completed / failed / timeout")
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[SearchResponse] = None
+    error: Optional[str] = None
