@@ -36,6 +36,7 @@ from syntheseus.reaction_prediction.inference.simpretro_match import (
     match_all_templates,
     MatchConfig,
 )
+from syntheseus.reaction_prediction.inference.shared_state import SharedArray, SharedWeights
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,39 @@ from syntheseus.reaction_prediction.inference.simpretro_match import (
 # Fork COW: children inherit _MATCH_MODEL set by __init__ (no pickling needed).
 # ---------------------------------------------------------------------------
 _MATCH_MODEL: Optional["SimpRetroModel"] = None
+
+
+def _reclaim_cow_pages():
+    """Discard COW dirty pages so the kernel re-inherits clean pages from the parent.
+
+    After fork, child processes share pages with the parent via COW.  When C++
+    code (rdchiral/RDKit) writes to internal caches during matching, those pages
+    become dirty and are copied.  Calling madvise(MADV_DONTNEED) on those pages
+    tells the kernel to discard the private copies; the next access will
+    re-inherit the parent's clean page (zero-cost for read-only data).
+    """
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    MADV_DONTNEED = 4
+    try:
+        with open("/proc/self/smaps", "r") as f:
+            start = end = 0
+            for line in f:
+                # Parse header lines: "560a00000000-560a08000000 rw-p 00000000 ..."
+                if "-" in line and " " in line.split("-")[1][:5]:
+                    parts = line.split()
+                    addr_range = parts[0].split("-")
+                    start = int(addr_range[0], 16)
+                    end = int(addr_range[1], 16)
+                # Look for Anonymous pages with Shared_Dirty > 0
+                elif line.startswith("Shared_Dirty:"):
+                    dirty_kb = int(line.split()[1])
+                    if dirty_kb > 0 and start and end:
+                        length = end - start
+                        libc.madvise(ctypes.c_void_p(start), length, MADV_DONTNEED)
+                    start = end = 0
+    except Exception:
+        pass  # best-effort, don't crash the search
 
 
 def _match_single_molecule(smiles: str, num_results: int, threshold: float = 0.2):
@@ -59,27 +93,33 @@ def _match_single_molecule(smiles: str, num_results: int, threshold: float = 0.2
     results = dict(out.results)
     valid_template_id = list(out.valid_template_ids)
 
-    # --- Neural network filtering: copied verbatim from simpretro_old.py:244-267 ---
-    valid_temp_fps = _MATCH_MODEL.template_fps[valid_template_id]
-    p_fp = smiles_to_fingerprint(smiles)
+    # --- Neural network filtering (reads from SharedMemory, int16 → float32) ---
+    valid_temp_fps = _MATCH_MODEL._fps_shm.arr[valid_template_id].astype(np.float32)
+    # Ensure 2D: (N, FP_DIM) even when N=1
+    if valid_temp_fps.ndim == 1:
+        valid_temp_fps = valid_temp_fps.reshape(1, -1)
+    p_fp = smiles_to_fingerprint(smiles).astype(np.float32)
     try:
         data = torch.tensor(
             np.concatenate(
-                [valid_temp_fps.squeeze(), np.repeat(p_fp, len(valid_temp_fps), axis=0)],
+                [valid_temp_fps, np.repeat(p_fp, len(valid_temp_fps), axis=0)],
                 axis=1,
             ),
             dtype=torch.float32,
         )
         with torch.no_grad():
-            pred = _MATCH_MODEL.filter(data).squeeze().cpu().numpy()
+            pred = _MATCH_MODEL.filter(data).cpu().numpy().flatten()
+        # O(1) dict lookup instead of O(N) list.index()
+        idx_map = {v: i for i, v in enumerate(valid_template_id)}
         validated_results = {}
         for i, (k, v) in enumerate(results.items()):
-            if pred[valid_template_id.index(v[2])] > threshold or v[-1]:
+            pos = idx_map[v[2]]
+            if pred[pos] > threshold or v[-1]:
                 validated_results[k] = (
                     v[0],
                     v[1],
                     v[2],
-                    pred[valid_template_id.index(v[2])],
+                    pred[pos],
                 )
     except Exception as e:
         print(f"Error in neural filter: {e}")
@@ -91,6 +131,9 @@ def _match_single_molecule(smiles: str, num_results: int, threshold: float = 0.2
         key=lambda item: item[1][0] + 0.001 * item[1][-1],
         reverse=True,
     )[:num_results]
+
+    # Reclaim COW dirty pages (C++ TemplateLibrary caches written during matching)
+    _reclaim_cow_pages()
 
     if len(results) > 0:
         reactants, scores = zip(*results)
@@ -183,7 +226,7 @@ class SimpRetroModel(ExternalBackwardReactionModel):
         self.match_config.w_md = 0.0       # MDScore: 多样性得分，预测反应物个数的倒数
         self.match_config.w_private = 0.0  # private_bonus: 私有模板加成权重（private_bonus=10.0）
 
-        # Use shared fingerprint_base from fast_filter module
+        # Build template fingerprints (same logic as before)
         self.fingerprint_base = filter_fingerprint_base
         self.template_fps = []
         for template in self.templates_raw:
@@ -194,18 +237,37 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                 self.template_fps.append(fp)
                 self.fingerprint_base[template] = fp
         self.template_fps = np.array(self.template_fps)
-        # Save updated fingerprints
         save_fingerprint_base()
+
+        # Compress dtype: int64 → int16 (values range -170..1080, 4x smaller)
+        self.template_fps = self.template_fps.squeeze().astype(np.int16)
+
+        # Place into POSIX shared memory (MAP_SHARED, no COW degradation)
+        self._fps_shm = SharedArray(
+            name="simpretro_fps", create=True, data=self.template_fps
+        )
+
+        # Release fingerprint_base dict (~2.4 GB) — no longer needed
+        self.fingerprint_base = None
+        globals()['filter_fingerprint_base'] = {}
+        import syntheseus.reaction_prediction.fast_filter.model as _fm
+        _fm.fingerprint_base = {}
+        import gc; gc.collect()
 
         # Load neural network filter
         self.filter = Net_orig()
-        # Load model weights from package data
         with importlib.resources.files(
             "syntheseus.reaction_prediction.fast_filter"
         ).joinpath("model_smoothbce.pth") as model_path:
             self.filter.load_state_dict(
                 torch.load(str(model_path), map_location=self.device)
             )
+        self.filter.eval()  # prevent BatchNorm from writing to shared weights
+
+        # Place filter weights into shared memory (zero-copy in forked children)
+        self._weights_shm = SharedWeights(
+            name="simpretro_weights", create=True, model=self.filter
+        )
 
         # Pool is created lazily in _get_reactions, not here.
         # This avoids issues with fork inheritance and nested ProcessPoolExecutor
