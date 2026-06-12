@@ -209,7 +209,8 @@ class SimpRetroModel(ExternalBackwardReactionModel):
                 tmp.write(smi + "\n")
             tmp.close()
             self.cpp_template_lib.set_inventory_file(tmp.name)
-            print(f"Wrote {len(inventory_file)} inventory SMILES to temp file: {tmp.name}")
+            os.unlink(tmp.name)  # C++ 已读入内存，删除临时文件
+            print(f"Wrote {len(inventory_file)} inventory SMILES to temp file (cleaned up)")
         else:
             self.cpp_template_lib.set_inventory_file(str(inventory_file))
 
