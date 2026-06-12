@@ -262,7 +262,6 @@ class SimpRetroModel(ExternalBackwardReactionModel):
             self.filter.load_state_dict(
                 torch.load(str(model_path), map_location=self.device)
             )
-        self.filter.eval()  # prevent BatchNorm from writing to shared weights
 
         # Place filter weights into shared memory (zero-copy in forked children)
         self._weights_shm = SharedWeights(
