@@ -81,3 +81,5 @@ class TaskStatusResponse(BaseModel):
     status: str = Field(..., description="任务状态: pending / running / completed / failed")
     result: Optional[SearchResponse] = Field(default=None, description="搜索结果（status=completed 时有值）")
     error: Optional[str] = Field(default=None, description="错误信息（status=failed 时有值）")
+    graph_nodes: int = Field(default=0, description="当前搜索图节点数（搜索进行中时实时更新）")
+    rxn_calls: int = Field(default=0, description="反应模型调用次数（搜索进行中时实时更新）")

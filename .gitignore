@@ -8,7 +8,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
-
+search_graphs/
 # C extensions
 *.so
 

@@ -95,11 +95,12 @@ def init_worker(inventory_smiles: set, canonicalize: bool = False) -> None:
     logger.info("Worker: model loaded, ready for search")
 
 
-def run_search(req: SearchRequest) -> dict:
+def run_search(req: SearchRequest, progress_file: str = None) -> dict:
     """在工作进程中执行一次搜索。
 
     Args:
         req: 搜索请求
+        progress_file: 进度文件路径，用于实时上报图节点数和反应调用次数
 
     Returns:
         搜索结果的 dict 表示（Pydantic model 序列化）
@@ -121,6 +122,44 @@ def run_search(req: SearchRequest) -> dict:
 
     start = time.time()
     target = Molecule(req.smiles)
+
+    # 如果有进度文件路径，创建一个后台线程定期更新进度
+    progress_updater = None
+    if progress_file is not None:
+        import threading
+
+        class ProgressUpdater:
+            """定期将搜索进度写入文件。"""
+
+            def __init__(self, filepath):
+                self.filepath = filepath
+                self._graph = None
+                self._alg = None
+                self._stop = threading.Event()
+                self._thread = None
+
+            def start(self, graph, alg):
+                self._graph = graph
+                self._alg = alg
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+
+            def stop(self):
+                self._stop.set()
+                if self._thread:
+                    self._thread.join(timeout=1.0)
+
+            def _run(self):
+                while not self._stop.is_set():
+                    try:
+                        nodes = len(self._graph) if self._graph is not None else 0
+                        calls = self._alg.reaction_model.num_calls() if self._alg is not None else 0
+                        Path(self.filepath).write_text(f"{nodes},{calls}")
+                    except Exception:
+                        pass
+                    self._stop.wait(0.5)  # 每 0.5 秒更新一次
+
+        progress_updater = ProgressUpdater(progress_file)
 
     # Build algorithm (对齐 engine.py _build_algorithm)
     bto = req.build_tree_options
@@ -178,11 +217,27 @@ def run_search(req: SearchRequest) -> dict:
         with open(graph_path, "rb") as f:
             graph = pickle.load(f)
         logger.info("Worker: loaded graph from %s (%d nodes)", graph_path, len(graph))
+        # 启动进度更新线程
+        if progress_updater:
+            progress_updater.start(graph, alg)
         alg.run_from_graph(graph)
     else:
-        # 全新搜索
+        # 全新搜索：分开创建 graph 和运行搜索，以便实时更新进度
         alg.reset()
-        graph, _ = alg.run_from_mol(target)
+        graph = alg.create_graph(target)
+        # 启动进度更新线程
+        if progress_updater:
+            progress_updater.start(graph, alg)
+        alg.run_from_graph(graph)
+
+    # 停止进度更新线程
+    if progress_updater:
+        progress_updater.stop()
+        # 最终更新一次
+        try:
+            Path(progress_file).write_text(f"{len(graph)},{alg.reaction_model.num_calls()}")
+        except Exception:
+            pass
 
     elapsed = time.time() - start
 

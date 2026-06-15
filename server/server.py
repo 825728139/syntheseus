@@ -133,14 +133,35 @@ class TaskStore:
 
     def create(self) -> str:
         task_id = uuid.uuid4().hex[:12]
+        # 进度文件路径：worker 写入，轮询接口读取
+        progress_file = Path(settings.GRAPH_DIR) / f"{task_id}.progress"
         with self._lock:
             self._tasks[task_id] = {
                 "status": "pending",
                 "result": None,
                 "error": None,
                 "created_at": time.time(),
+                "progress_file": progress_file,
             }
+        # 初始化进度文件
+        progress_file.write_text("0,0")
         return task_id
+
+    def get_progress(self, task_id: str) -> tuple[int, int]:
+        """获取任务的实时进度（节点数和反应调用次数）。"""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return 0, 0
+        # 从文件读取进度
+        progress_file = task["progress_file"]
+        try:
+            if progress_file.exists():
+                data = progress_file.read_text().strip().split(",")
+                return int(data[0]), int(data[1])
+        except Exception:
+            pass
+        return 0, 0
 
     def set_running(self, task_id: str) -> None:
         with self._lock:
@@ -168,10 +189,13 @@ class TaskStore:
         now = time.time()
         expired = [tid for tid, t in self._tasks.items() if now - t["created_at"] > self._ttl]
         for tid in expired:
-            # 清理关联的 graph 文件
+            # 清理关联的文件
             graph_path = Path(settings.GRAPH_DIR) / f"{tid}.pkl"
             if graph_path.exists():
                 graph_path.unlink()
+            progress_path = Path(settings.GRAPH_DIR) / f"{tid}.progress"
+            if progress_path.exists():
+                progress_path.unlink()
             del self._tasks[tid]
 
 
@@ -285,8 +309,11 @@ async def _run_search_task(task_id: str, req: SearchRequest, cache_key_options: 
     _task_store.set_running(task_id)
     executor_timeout = req.build_tree_options.expansion_time + 60
 
+    # 获取进度文件路径
+    progress_file = _task_store._tasks[task_id]["progress_file"]
+
     def _run_with_timeout() -> dict:
-        future = _pool.submit(run_search, req)
+        future = _pool.submit(run_search, req, str(progress_file))
         try:
             return future.result(timeout=executor_timeout)
         except Exception:
@@ -413,11 +440,21 @@ async def task_status(task_id: str):
     if task["result"] is not None:
         result = SearchResponse(**task["result"])
 
+    # 实时进度：从进度文件读取
+    graph_nodes, rxn_calls = _task_store.get_progress(task_id)
+
+    # 如果任务已完成，使用最终结果中的值
+    if task["status"] == "completed" and result is not None:
+        graph_nodes = result.graph_nodes
+        rxn_calls = result.rxn_calls
+
     return TaskStatusResponse(
         task_id=task_id,
         status=task["status"],
         result=result,
         error=task["error"],
+        graph_nodes=graph_nodes,
+        rxn_calls=rxn_calls,
     )
 
 
