@@ -425,7 +425,12 @@ async def retrosynthesis_search_async(req: SearchRequest):
     response_model=TaskStatusResponse,
     tags=["任务"],
     summary="查询异步任务状态",
-    description="轮询异步搜索任务的状态。status 为 completed 时 result 包含搜索结果，failed 时 error 包含错误信息。",
+    description=(
+        "轮询异步搜索任务的状态。\n\n"
+        "- `status=completed` 时 `result` 包含搜索结果\n"
+        "- `status=failed` 时 `error` 包含错误信息\n"
+        "- 搜索进行中时 `graph_nodes` 和 `rxn_calls` 提供实时进度（每 0.5 秒更新）"
+    ),
     responses={
         404: {"description": "任务不存在或已过期（1h TTL）"},
     },
