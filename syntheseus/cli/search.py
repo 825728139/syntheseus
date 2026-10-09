@@ -655,9 +655,9 @@ def run_from_config(config: SearchConfig) -> Path:
                         if edge_data and "reaction" in edge_data:
                             reaction = edge_data["reaction"]
                             rxn_smiles = reaction.reaction_smiles
-                            probability = reaction.metadata['probability']
-                            score = reaction.metadata['score']
-                            template = edge_data['reaction'].metadata['template']
+                            probability = reaction.metadata.get('probability', 0.0)
+                            score = reaction.metadata.get('score', 0.0)
+                            template = edge_data['reaction'].metadata.get('template', '')
                             product = [*reaction.products]
                             reactants = [*reaction.reactants]
 
@@ -1034,10 +1034,10 @@ if __name__ == "__main__":
         # "resume_search=/home/liwenlong/retro_mcts_results/SimpRetro_2026-03-12T17:37:38"
         argv = [
             "inventory_smiles_file=/home/liwenlong/chemTools/retro_syn/syntheseus/emolecules.txt",
-            "search_target=CC(=O)Oc1ccccc1C(=O)O",
-            "model_class=SimpRetro",
-            "model_dir=/home/liwenlong/chemTools/retro_syn/syntheseus/SimpRetro_templates.json",
-            "time_limit_s=30",
+            "search_target='C(C1=CC=CC=C1)N1CCC(CC1)CCC#N'",
+            "model_class=RetroKNN",
+            # model_dir auto-detected from model_paths.json
+            "time_limit_s=60",
             "search_algorithm=mcts",
             "results_dir=retro_mcts_results/",
             "use_gpu=False",
@@ -1046,5 +1046,6 @@ if __name__ == "__main__":
             "expand_purchasable_target=True"
         ]
         main(argv=argv)
-        
-#retro_star mcts
+
+# 模型路径配置: syntheseus/reaction_prediction/inference/model_paths.json
+# RootAligned RetroKNN SimpRetro

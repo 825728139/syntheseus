@@ -1,4 +1,6 @@
+import json
 import logging
+from pathlib import Path
 from typing import Union
 
 from omegaconf import OmegaConf
@@ -7,6 +9,24 @@ from syntheseus.interface.models import ReactionModel
 from syntheseus.reaction_prediction.inference.config import BackwardModelConfig, ForwardModelConfig
 
 logger = logging.getLogger(__file__)
+
+# Auto-detect model_dir from model_paths.json if not specified
+_MODEL_PATHS_FILE = Path(__file__).parent.parent / "inference" / "model_paths.json"
+
+
+def _resolve_model_dir(config) -> str:
+    """Resolve model_dir: explicit > model_paths.json > MISSING."""
+    model_dir = OmegaConf.select(config, "model_dir")
+    if model_dir and model_dir != "???":
+        return model_dir
+    # Try model_paths.json
+    if _MODEL_PATHS_FILE.exists():
+        paths = json.loads(_MODEL_PATHS_FILE.read_text())
+        model_name = config.model_class.name
+        if model_name in paths:
+            logger.info("Auto-detected model_dir for %s: %s", model_name, paths[model_name])
+            return paths[model_name]
+    return model_dir  # MISSING
 
 
 def get_model(
@@ -22,7 +42,7 @@ def get_model(
 
     def model_fn(device):
         return config.model_class.value(
-            model_dir=OmegaConf.select(config, "model_dir"),
+            model_dir=_resolve_model_dir(config),
             device=device,
             **config.model_kwargs,
             **model_kwargs,

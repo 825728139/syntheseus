@@ -68,6 +68,7 @@ class Settings:
 
     # Graph storage
     GRAPH_DIR: str = os.getenv("GRAPH_DIR", "./search_graphs")
+    GRAPH_TTL_SECONDS: int = int(os.getenv("GRAPH_TTL_SECONDS", "3600"))
 
 
 settings = Settings()
@@ -292,10 +293,31 @@ app = FastAPI(
 )
 
 
+def _cleanup_stale_graphs() -> None:
+    """删除超过 TTL 的 .pkl 图缓存文件（基于文件修改时间）。"""
+    graph_dir = Path(settings.GRAPH_DIR)
+    if not graph_dir.exists():
+        return
+    ttl = settings.GRAPH_TTL_SECONDS
+    now = time.time()
+    removed = 0
+    for pkl_file in graph_dir.glob("*.pkl"):
+        try:
+            if now - pkl_file.stat().st_mtime > ttl:
+                pkl_file.unlink()
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info("Cleaned up %d stale graph files (TTL=%ds)", removed, ttl)
+
+
 def _process_graph_result(result_dict: dict, task_id: str) -> dict:
     """保存 graph 并设置 graph_id，从结果中移除 graph 对象。"""
     graph_obj = result_dict.pop("graph", None)
     if graph_obj is not None:
+        # 顺带清理过期图文件
+        _cleanup_stale_graphs()
         graph_path = Path(settings.GRAPH_DIR) / f"{task_id}.pkl"
         with open(graph_path, "wb") as f:
             pickle.dump(graph_obj, f)

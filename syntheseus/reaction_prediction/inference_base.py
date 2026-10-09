@@ -15,7 +15,9 @@ class ExternalReactionModel(ReactionModel[InputType, ReactionType]):
     """Base class for the external reaction models, abstracting out common functinality."""
 
     def __init__(
-        self, model_dir: Optional[Union[str, Path]] = None, device: Optional[str] = None, **kwargs
+        self, model_dir: Optional[Union[str, Path]] = None, device: Optional[str] = None,
+        inventory_file=None,  # SimpRetro 专用，其他模型忽略
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         import torch
