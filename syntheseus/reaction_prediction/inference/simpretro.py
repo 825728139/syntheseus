@@ -99,31 +99,36 @@ def _match_single_molecule(smiles: str, num_results: int, threshold: float = 0.2
     if valid_temp_fps.ndim == 1:
         valid_temp_fps = valid_temp_fps.reshape(1, -1)
     p_fp = smiles_to_fingerprint(smiles).astype(np.float32)
-    try:
-        data = torch.tensor(
-            np.concatenate(
-                [valid_temp_fps, np.repeat(p_fp, len(valid_temp_fps), axis=0)],
-                axis=1,
-            ),
-            dtype=torch.float32,
-        )
-        with torch.no_grad():
-            pred = _MATCH_MODEL.filter(data).cpu().numpy().flatten()
-        # O(1) dict lookup instead of O(N) list.index()
-        idx_map = {v: i for i, v in enumerate(valid_template_id)}
-        validated_results = {}
-        for i, (k, v) in enumerate(results.items()):
-            pos = idx_map[v[2]]
-            if pred[pos] > threshold or v[-1]:
-                validated_results[k] = (
-                    v[0],
-                    v[1],
-                    v[2],
-                    pred[pos],
-                )
-    except Exception as e:
-        print(f"Error in neural filter: {e}")
-        validated_results = {}
+
+    # BatchNorm requires batch_size > 1 in train mode; skip filter for single template
+    if len(valid_template_id) <= 1:
+        validated_results = {k: (v[0], v[1], v[2], 1.0) for k, v in results.items()}
+    else:
+        try:
+            data = torch.tensor(
+                np.concatenate(
+                    [valid_temp_fps, np.repeat(p_fp, len(valid_temp_fps), axis=0)],
+                    axis=1,
+                ),
+                dtype=torch.float32,
+            )
+            with torch.no_grad():
+                pred = _MATCH_MODEL.filter(data).cpu().numpy().flatten()
+            # O(1) dict lookup instead of O(N) list.index()
+            idx_map = {v: i for i, v in enumerate(valid_template_id)}
+            validated_results = {}
+            for i, (k, v) in enumerate(results.items()):
+                pos = idx_map[v[2]]
+                if pred[pos] > threshold or v[-1]:
+                    validated_results[k] = (
+                        v[0],
+                        v[1],
+                        v[2],
+                        pred[pos],
+                    )
+        except Exception as e:
+            print(f"Error in neural filter: {e}")
+            validated_results = {}
 
     # --- Sort and select top results: copied verbatim from simpretro_old.py:270-289 ---
     results = sorted(

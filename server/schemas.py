@@ -15,7 +15,7 @@ class BuildTreeOptions(BaseModel):
         }]
     })
 
-    expansion_time: float = Field(default=30.0, description="搜索时间上限（秒）")
+    expansion_time: float = Field(default=30.0, ge=30.0, description="搜索时间上限（秒），最小 30s")
     max_branching: int = Field(default=50, ge=1, le=500, description="最多返回路线数")
     max_iterations: int = Field(default=0, ge=0, description="迭代次数上限，0 = 不限制")
     expand_purchasable_target: bool = Field(default=True, description="即使目标分子在库存中也展开搜索")
